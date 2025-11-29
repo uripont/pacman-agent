@@ -1,1 +1,6 @@
 .DS_Store
+.game_counter
+.venv/
+__pycache__/
+pacman_agent.egg-info/
+pacman-contest/
