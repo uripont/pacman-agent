@@ -1,18 +1,4 @@
-# baseline_team.py
-# ---------------
-# Licensing Information:  You are free to use or extend these projects for
-# educational purposes provided that (1) you do not distribute or publish
-# solutions, (2) you retain this notice, and (3) you provide clear
-# attribution to UC Berkeley, including a link to http://ai.berkeley.edu.
-# 
-# Attribution Information: The Pacman AI projects were developed at UC Berkeley.
-# The core projects and autograders were primarily created by John DeNero
-# (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
-# Student side autograding was added by Brad Miller, Nick Hay, and
-# Pieter Abbeel (pabbeel@cs.berkeley.edu).
-
-
-# baseline_team.py
+# my_team.py
 # ---------------
 # Licensing Information: Please do not distribute or publish solutions to this
 # project. You are free to use and extend these projects for educational
@@ -21,11 +7,11 @@
 # For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
 
 import random
-import util
+import contest.util as util
 
-from capture_agents import CaptureAgent
-from game import Directions
-from util import nearest_point
+from contest.capture_agents import CaptureAgent
+from contest.game import Directions
+from contest.util import nearest_point
 
 
 #################
@@ -43,7 +29,7 @@ def create_team(first_index, second_index, is_red,
     As a potentially helpful development aid, this function can take
     additional string-valued keyword arguments ("first" and "second" are
     such arguments in the case of this function), which will come from
-    the --redOpts and --blueOpts command-line arguments to capture.py.
+    the --red_opts and --blue_opts command-line arguments to capture.py.
     For the nightly contest, however, your team will be created without
     any extra arguments, so you should make sure that the default
     behavior is what you want for the nightly contest.
@@ -146,7 +132,7 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
         features = util.Counter()
         successor = self.get_successor(game_state, action)
         food_list = self.get_food(successor).as_list()
-        features['successor_score'] = -len(food_list)  # self.get_score(successor)
+        features['successor_score'] = -len(food_list)  # self.getScore(successor)
 
         # Compute distance to the nearest food
 
