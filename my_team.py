@@ -30,9 +30,9 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.2, by Jorge and Oriol
+    """LaPulga v0.4.3, by Jorge and Oriol
     
-    MAIN FIX: Removed patch system to have strategy selection only.
+    MAIN FIX: Simplified Pathfinder logic and readability.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -420,89 +420,64 @@ class PathFinder:
     A* pathfinding from current position to goal.
     Avoids walls and dangerous ghosts.
     When ghost is nearby, also avoids dead-end corridors.
-    Heuristic currently is Manhattan distance to goal.
     """
     
-    _corridor_cache = {}  # Class-level cache for corridor analysis
+    _corridor_cache = {}  # Cache for corridor analysis
     
     @classmethod
     def get_dangerous_corridors(cls, game_state):
-        """Get all positions in dead-end corridors (cached per maze layout)."""
+        """Get all positions in dead-end/cul de sac corridors (cached per maze layout, so only once at the beginnnig)"""
         walls = game_state.get_walls()
         cache_key = str(walls)
-        
         if cache_key in cls._corridor_cache:
             return cls._corridor_cache[cache_key]
         
-        # Find dead-ends (positions with only 1 exit)
-        dead_ends = set()
-        for x in range(walls.width):
-            for y in range(walls.height):
-                if walls[x][y]:
-                    continue
-                exits = sum(1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
-                           if 0 <= x+dx < walls.width and 0 <= y+dy < walls.height
-                           and not walls[x+dx][y+dy])
-                if exits == 1:
-                    dead_ends.add((x, y))
+        def count_exits(x, y):
+            return sum(1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
+                      if 0 <= x+dx < walls.width and 0 <= y+dy < walls.height
+                      and not walls[x+dx][y+dy])
         
-        # Expand dead-ends to include their corridors
+        # Find dead-ends (positions with only 1 exit)
+        dead_ends = {(x, y) for x in range(walls.width) for y in range(walls.height)
+                    if not walls[x][y] and count_exits(x, y) == 1}
+        
+        # Expand dead-ends to include  corridors
         all_dangerous = set()
         for dead_end in dead_ends:
             all_dangerous.add(dead_end)
             current, visited = dead_end, {dead_end}
             
             for _ in range(5):  # Max corridor depth
-                neighbors = [(current[0]+dx, current[1]+dy) 
-                            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
-                            if 0 <= current[0]+dx < walls.width and 0 <= current[1]+dy < walls.height
-                            and not walls[current[0]+dx][current[1]+dy] and (current[0]+dx, current[1]+dy) not in visited]
+                neighbors = []
+                for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    nx, ny = current[0] + dx, current[1] + dy
+                    in_bounds = 0 <= nx < walls.width and 0 <= ny < walls.height
+                    not_wall = not walls[nx][ny]
+                    not_visited = (nx, ny) not in visited
+                    
+                    if in_bounds and not_wall and not_visited:
+                        neighbors.append((nx, ny))
                 
-                if len(neighbors) != 1:
+                if len(neighbors) != 1 or count_exits(neighbors[0][0], neighbors[0][1]) > 2:
                     break
                 
-                next_pos = neighbors[0]
-                exits = sum(1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
-                           if 0 <= next_pos[0]+dx < walls.width and 0 <= next_pos[1]+dy < walls.height
-                           and not walls[next_pos[0]+dx][next_pos[1]+dy])
-                
-                if exits > 2:
-                    break
-                
-                all_dangerous.add(next_pos)
-                visited.add(next_pos)
-                current = next_pos
+                current = neighbors[0]
+                all_dangerous.add(current)
+                visited.add(current)
         
         cls._corridor_cache[cache_key] = all_dangerous
         return all_dangerous
     
     def search(self, game_state, agent, goal):
-        """
-        Find optimal path to goal using A* search.
-        
-        Args:
-            game_state: Current game state
-            agent: The agent searching (needs get_maze_distance, get_opponents)
-            goal: Target position (x, y)
-        
-        Returns:
-            List of actions to reach goal, or None if no path found
-        """
+        """Find optimal path to goal using A* search avoiding ghosts and corridors."""
         start_pos = game_state.get_agent_position(agent.index)
-        
-        # Priority Queue: (priority, (position, path))
         pq = util.PriorityQueue()
         pq.push((start_pos, []), 0)
-        
         visited = set()
         
-        # Identify dangerous positions and ghost proximity info
+        # Get threat analysis to avoid ghosts
         dangers, ghost_nearby, closest_ghost_pos = self._get_danger_info(game_state, agent)
-        
-        # If ghost is nearby, get dangerous corridor positions to penalize
-        corridor_dangers = set()
-        if ghost_nearby and closest_ghost_pos:
-            corridor_dangers = PathFinder.get_dangerous_corridors(game_state)
+        corridor_dangers = PathFinder.get_dangerous_corridors(game_state) if ghost_nearby else set()
         
         while not pq.is_empty():
             curr_pos, path = pq.pop()
@@ -517,83 +492,61 @@ class PathFinder:
             # Limit path length to avoid timeout
             if len(path) > 200: # 20 was too short to go outside spawn
                 continue
-
-            x, y = curr_pos
             
             # Explore neighbors
-            candidates = [
-                (0, 1, Directions.NORTH),
-                (0, -1, Directions.SOUTH),
-                (1, 0, Directions.EAST),
-                (-1, 0, Directions.WEST)
-            ]
-            
-            for dx, dy, action in candidates:
-                next_x, next_y = int(x + dx), int(y + dy)
+            for dx, dy, action in [(0, 1, Directions.NORTH), (0, -1, Directions.SOUTH),
+                                   (1, 0, Directions.EAST), (-1, 0, Directions.WEST)]:
+                next_x, next_y = int(curr_pos[0] + dx), int(curr_pos[1] + dy)
                 next_pos = (next_x, next_y)
                 
-                # Skip if wall
-                if game_state.get_walls()[next_x][next_y]:
+                # Skip walls and immediate ghost positions
+                if game_state.get_walls()[next_x][next_y] or next_pos in dangers:
                     continue
                 
-                # Skip if dangerous position (ghost is there)
-                if next_pos in dangers:
-                    continue
-                
-                # Calculate f = g + h (cost + heuristic)
+                # Calculate A* score: g (cost) + h (heuristic) + corridor penalty
                 g = len(path) + 1
-                h = agent.get_maze_distance(next_pos, goal)
+                h = agent.get_maze_distance(next_pos, goal) 
+                penalty = 0
                 
-                # Add heavy penalty for entering corridors when ghost is nearby
-                corridor_penalty = 0
+                # Penalize corridor entry if ghost is nearby
                 if ghost_nearby and next_pos in corridor_dangers:
-                    # Check if ghost could trap us in this corridor
                     ghost_dist = agent.get_maze_distance(closest_ghost_pos, next_pos)
-                    our_dist = len(path) + 1
-                    
-                    # If ghost is closer or same distance to this corridor position, heavy penalty
-                    if ghost_dist <= our_dist + 3:
-                        corridor_penalty = 100  # Very high penalty to avoid this path
+                    if ghost_dist <= g + 3:  # Ghost could trap us
+                        penalty = 100
                 
-                f = g + h + corridor_penalty
-                
-                new_path = path + [action]
-                pq.push((next_pos, new_path), f)
-                
+                f = g + h + penalty
+                pq.push((next_pos, path + [action]), f)
+        
         return None
     
     def _get_danger_info(self, game_state, agent):
-        """
-        Get dangerous positions and ghost proximity information.
-        
-        Returns:
-            tuple: (set of danger positions, bool if ghost is nearby, closest ghost position)
-        """
         dangers = set()
-        enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
-        agent_pos = game_state.get_agent_position(agent.index)
-        
-        closest_ghost_dist = float('inf')
-        closest_ghost_pos = None
         ghost_nearby = False
+        closest_ghost_pos = None
+        closest_ghost_dist = float('inf')
+        
+        agent_pos = game_state.get_agent_position(agent.index)
+        enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
         
         for enemy in enemies:
-            # Only dangerous if: ghost (not pacman), visible, not scared
-            if not enemy.is_pacman and enemy.get_position() is not None and enemy.scared_timer <= 0:
-                ghost_pos = enemy.get_position()
-                dist = agent.get_maze_distance(agent_pos, ghost_pos)
-                
-                # Track closest ghost
-                if dist < closest_ghost_dist:
-                    closest_ghost_dist = dist
-                    closest_ghost_pos = ghost_pos
-                
-                # Mark ghost position as danger if close
-                if dist <= 2:
-                    dangers.add(ghost_pos)
-                
-                # Consider ghost "nearby" if within 6 steps
-                if dist <= 6:
-                    ghost_nearby = True
+            # Only consider dangerous ghosts (not pacman, visible, not scared)
+            if enemy.is_pacman or enemy.get_position() is None or enemy.scared_timer > 0:
+                continue
+            
+            ghost_pos = enemy.get_position()
+            dist = agent.get_maze_distance(agent_pos, ghost_pos)
+            
+            # Track closest dangerous ghost
+            if dist < closest_ghost_dist:
+                closest_ghost_dist = dist
+                closest_ghost_pos = ghost_pos
+            
+            # Mark as dangerous if very close
+            if dist <= 2:
+                dangers.add(ghost_pos)
+            
+            # Mark nearby if moderately close
+            if dist <= 6:
+                ghost_nearby = True
         
         return dangers, ghost_nearby, closest_ghost_pos
