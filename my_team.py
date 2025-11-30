@@ -32,7 +32,12 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.2.0, by Jorge and Oriol
+    """LaPulga v0.2.1, by Jorge and Oriol
+    
+    MAIN FIX: Fixed spawn exiting. Previously, agents would get stuck in spawn zone, 
+    the pathfinder returned no path and the agent would do the fallback (random move).
+    To detect these cases, fallback is now STOP. Also, pathfinder path length limit 
+    increased to 200 (20 wasn't enough).
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -75,19 +80,9 @@ class LaPulga(CaptureAgent):
             path = self.path_finder.search(game_state, self, self.goal)
             if path:
                 return path[0]
-
-            
-        # Fallback mechanism
-        # TODO: should not be needed/reached
-        # If no path is found or no goal is set, choose a random legal action
-        # We try to avoid stopping or reversing if possible to keep moving
-        actions = game_state.get_legal_actions(self.index)
-        good_actions = [a for a in actions if a != Directions.STOP]
         
-        if not good_actions:
-            return Directions.STOP
-            
-        return random.choice(good_actions)
+        # Fallback: return STOP to make issues visible
+        return Directions.STOP
 
 
 ###########################
@@ -416,7 +411,7 @@ class PathFinder:
                 return path
             
             # Limit path length to avoid timeout
-            if len(path) > 20: 
+            if len(path) > 200: # 20 was too short to go outside spawn
                 continue
 
             x, y = curr_pos
@@ -453,23 +448,23 @@ class PathFinder:
     
     def _get_danger_positions(self, game_state, agent):
         """
-        Get set of dangerous positions (non-pacman ghosts and adjacent cells).
+        Get set of dangerous positions (non-pacman ghosts only).
+        Only avoid ghosts that are very close.
         
         Returns:
             set of (x, y) positions to avoid
         """
         dangers = set()
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
+        agent_pos = game_state.get_agent_position(agent.index)
         
         for enemy in enemies:
-            # Only dangerous if: ghost (not pacman), visible, and not scared
+            # Only dangerous if: ghost (not pacman), visible, not scared and close
             if not enemy.is_pacman and enemy.get_position() is not None and enemy.scared_timer <= 0:
                 ghost_pos = enemy.get_position()
-                dangers.add(ghost_pos)
-                
-                # Add adjacent positions to safety buffer
-                gx, gy = ghost_pos
-                for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    dangers.add((gx + dx, gy + dy))
+                # Hotfix:Only avoid if within 2 steps
+                dist = agent.get_maze_distance(agent_pos, ghost_pos)
+                if dist <= 2:
+                    dangers.add(ghost_pos)
         
         return dangers
