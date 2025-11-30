@@ -32,10 +32,10 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.3.0, by Jorge and Oriol
+    """LaPulga v0.4.0, by Jorge and Oriol
     
-    MAIN IDEA: Our agent (same brain) now decides whether to focus on upper or lower half,
-    which leads to totally different plays compared to our previous versions.
+    MAIN IDEA: Now detects corridors and avoids unsafe food in them. When being chased,
+    avoids entering corridors that could trap us leading to dead-ends / easy kills.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -173,6 +173,21 @@ class SituationAnalyzer:
                                    if not e.is_pacman and e.get_position() is not None and e.scared_timer > 0]
         situation.has_scared_ghosts = len(situation.scared_ghosts) > 0
         
+        # Dangerous ghosts (non-pacman, not scared, visible) - these can kill us when we're attacking
+        situation.dangerous_ghosts = [e for e in enemies 
+                                      if not e.is_pacman and e.get_position() is not None and e.scared_timer <= 0]
+        situation.has_dangerous_ghosts = len(situation.dangerous_ghosts) > 0
+        
+        if situation.dangerous_ghosts:
+            ghost_positions = [g.get_position() for g in situation.dangerous_ghosts]
+            closest_ghost_dist = min(agent.get_maze_distance(agent_pos, gpos) for gpos in ghost_positions)
+            situation.closest_dangerous_ghost_distance = closest_ghost_dist
+            situation.closest_dangerous_ghost_pos = min(ghost_positions, 
+                                                        key=lambda gpos: agent.get_maze_distance(agent_pos, gpos))
+        else:
+            situation.closest_dangerous_ghost_distance = float('inf')
+            situation.closest_dangerous_ghost_pos = None
+        
         # Our scared state (we are a pacman and have scared timer)
         agent_state = game_state.get_agent_state(agent.index)
         situation.we_are_scared = agent_state.is_pacman and agent_state.scared_timer > 0
@@ -234,6 +249,11 @@ class Situation:
         
         self.scared_ghosts = []
         self.has_scared_ghosts = False
+        
+        self.dangerous_ghosts = []
+        self.has_dangerous_ghosts = False
+        self.closest_dangerous_ghost_distance = float('inf')
+        self.closest_dangerous_ghost_pos = None
         
         self.we_are_scared = False
         self.scared_timer_remaining = 0
@@ -351,7 +371,7 @@ class GoalChooser:
     
     # Drafting goal strategies
     def _goal_attack(self, game_state, agent, situation):
-        """Attack strategy: Go for closest food, preferring food in assigned territory."""
+        """Attack strategy: Go for closest food, preferring safe food when ghost is nearby."""
         if not situation.closest_food_pos:
             return agent.start
         
@@ -371,12 +391,76 @@ class GoalChooser:
                 # This agent focuses on lower half
                 assigned_food = [f for f in food_list if f[1] < midline_y]
             
-            # If we have food in our assigned territory, go for closest in that territory
+            # If we have food in our assigned territory, use that list
             if assigned_food:
-                return min(assigned_food, key=lambda f: agent.get_maze_distance(situation.agent_pos, f))
+                food_list = assigned_food
         
-        # Fallback: go for globally closest food
-        return situation.closest_food_pos
+        # SAFETY CHECK: When a dangerous ghost is nearby, filter out unsafe food
+        ghost_nearby_threshold = 6  # Distance at which we start being cautious
+        
+        if situation.has_dangerous_ghosts and situation.closest_dangerous_ghost_distance <= ghost_nearby_threshold:
+            ghost_pos = situation.closest_dangerous_ghost_pos
+            
+            # Filter food to only safe options
+            safe_food = [f for f in food_list 
+                        if self._is_food_safe(game_state, agent, f, 
+                                              situation.agent_pos, ghost_pos)]
+            
+            if safe_food:
+                # Pick closest safe food
+                return min(safe_food, key=lambda f: agent.get_maze_distance(situation.agent_pos, f))
+            else:
+                # No safe food! Switch to return mode or find escape route
+                # Return to home boundary for safety
+                return self._goal_return(game_state, agent, situation)
+        
+        # No immediate danger, go for closest food
+        return min(food_list, key=lambda f: agent.get_maze_distance(situation.agent_pos, f))
+    
+    def _is_food_safe(self, game_state, agent, food_pos, agent_pos, ghost_pos):
+        """Check if pursuing food is safe given a nearby ghost."""
+        corridor_positions = PathFinder.get_dangerous_corridors(game_state)
+        
+        # If food is not in a corridor, it's safe
+        if food_pos not in corridor_positions:
+            return True
+        
+        # Food is in a corridor - check if we could escape after eating it
+        walls = game_state.get_walls()
+        visited = {food_pos}
+        current = food_pos
+        
+        for _ in range(10):  # Max corridor length
+            neighbors = []
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = current[0] + dx, current[1] + dy
+                if 0 <= nx < walls.width and 0 <= ny < walls.height:
+                    if not walls[nx][ny] and (nx, ny) not in visited:
+                        neighbors.append((nx, ny))
+            
+            if not neighbors:
+                break
+            
+            # Count exits of current position
+            exits = sum(1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
+                       if 0 <= current[0]+dx < walls.width and 0 <= current[1]+dy < walls.height
+                       and not walls[current[0]+dx][current[1]+dy])
+            
+            if exits > 2:  # Found junction (corridor exit)
+                dist_agent_to_food = agent.get_maze_distance(agent_pos, food_pos)
+                dist_food_to_exit = agent.get_maze_distance(food_pos, current)
+                dist_ghost_to_exit = agent.get_maze_distance(ghost_pos, current)
+                
+                agent_total_dist = dist_agent_to_food + dist_food_to_exit
+                if dist_ghost_to_exit <= agent_total_dist + 2:
+                    return False  # Ghost could cut us off
+                return True
+            
+            visited.add(neighbors[0])
+            current = neighbors[0]
+        
+        # Couldn't find exit, assume unsafe if ghost is close
+        return agent.get_maze_distance(agent_pos, ghost_pos) > 5
     
     def _goal_defend(self, game_state, agent, situation):
         """Defend strategy: Go for closest visible invader."""
@@ -456,8 +540,62 @@ class PathFinder:
     """
     A* pathfinding from current position to goal.
     Avoids walls and dangerous ghosts.
+    When ghost is nearby, also avoids dead-end corridors.
     Heuristic currently is Manhattan distance to goal.
     """
+    
+    _corridor_cache = {}  # Class-level cache for corridor analysis
+    
+    @classmethod
+    def get_dangerous_corridors(cls, game_state):
+        """Get all positions in dead-end corridors (cached per maze layout)."""
+        walls = game_state.get_walls()
+        cache_key = str(walls)
+        
+        if cache_key in cls._corridor_cache:
+            return cls._corridor_cache[cache_key]
+        
+        # Find dead-ends (positions with only 1 exit)
+        dead_ends = set()
+        for x in range(walls.width):
+            for y in range(walls.height):
+                if walls[x][y]:
+                    continue
+                exits = sum(1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
+                           if 0 <= x+dx < walls.width and 0 <= y+dy < walls.height
+                           and not walls[x+dx][y+dy])
+                if exits == 1:
+                    dead_ends.add((x, y))
+        
+        # Expand dead-ends to include their corridors
+        all_dangerous = set()
+        for dead_end in dead_ends:
+            all_dangerous.add(dead_end)
+            current, visited = dead_end, {dead_end}
+            
+            for _ in range(5):  # Max corridor depth
+                neighbors = [(current[0]+dx, current[1]+dy) 
+                            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
+                            if 0 <= current[0]+dx < walls.width and 0 <= current[1]+dy < walls.height
+                            and not walls[current[0]+dx][current[1]+dy] and (current[0]+dx, current[1]+dy) not in visited]
+                
+                if len(neighbors) != 1:
+                    break
+                
+                next_pos = neighbors[0]
+                exits = sum(1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
+                           if 0 <= next_pos[0]+dx < walls.width and 0 <= next_pos[1]+dy < walls.height
+                           and not walls[next_pos[0]+dx][next_pos[1]+dy])
+                
+                if exits > 2:
+                    break
+                
+                all_dangerous.add(next_pos)
+                visited.add(next_pos)
+                current = next_pos
+        
+        cls._corridor_cache[cache_key] = all_dangerous
+        return all_dangerous
     
     def search(self, game_state, agent, goal):
         """
@@ -479,8 +617,13 @@ class PathFinder:
         
         visited = set()
         
-        # Identify dangerous positions (non-pacman ghosts)
-        dangers = self._get_danger_positions(game_state, agent)
+        # Identify dangerous positions and ghost proximity info
+        dangers, ghost_nearby, closest_ghost_pos = self._get_danger_info(game_state, agent)
+        
+        # If ghost is nearby, get dangerous corridor positions to penalize
+        corridor_dangers = set()
+        if ghost_nearby and closest_ghost_pos:
+            corridor_dangers = PathFinder.get_dangerous_corridors(game_state)
         
         while not pq.is_empty():
             curr_pos, path = pq.pop()
@@ -514,39 +657,64 @@ class PathFinder:
                 if game_state.get_walls()[next_x][next_y]:
                     continue
                 
-                # Skip if dangerous position
+                # Skip if dangerous position (ghost is there)
                 if next_pos in dangers:
                     continue
                 
                 # Calculate f = g + h (cost + heuristic)
                 g = len(path) + 1
                 h = agent.get_maze_distance(next_pos, goal)
-                f = g + h
+                
+                # Add heavy penalty for entering corridors when ghost is nearby
+                corridor_penalty = 0
+                if ghost_nearby and next_pos in corridor_dangers:
+                    # Check if ghost could trap us in this corridor
+                    ghost_dist = agent.get_maze_distance(closest_ghost_pos, next_pos)
+                    our_dist = len(path) + 1
+                    
+                    # If ghost is closer or same distance to this corridor position, heavy penalty
+                    if ghost_dist <= our_dist + 3:
+                        corridor_penalty = 100  # Very high penalty to avoid this path
+                
+                f = g + h + corridor_penalty
                 
                 new_path = path + [action]
                 pq.push((next_pos, new_path), f)
                 
         return None
     
-    def _get_danger_positions(self, game_state, agent):
+    def _get_danger_info(self, game_state, agent):
         """
-        Get set of dangerous positions (non-pacman ghosts only).
-        Only avoid ghosts that are very close.
+        Get dangerous positions and ghost proximity information.
         
         Returns:
-            set of (x, y) positions to avoid
+            tuple: (set of danger positions, bool if ghost is nearby, closest ghost position)
         """
         dangers = set()
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
         agent_pos = game_state.get_agent_position(agent.index)
         
+        closest_ghost_dist = float('inf')
+        closest_ghost_pos = None
+        ghost_nearby = False
+        
         for enemy in enemies:
-            # Only dangerous if: ghost (not pacman), visible, not scared and close
+            # Only dangerous if: ghost (not pacman), visible, not scared
             if not enemy.is_pacman and enemy.get_position() is not None and enemy.scared_timer <= 0:
                 ghost_pos = enemy.get_position()
-                # Hotfix:Only avoid if within 2 steps
                 dist = agent.get_maze_distance(agent_pos, ghost_pos)
+                
+                # Track closest ghost
+                if dist < closest_ghost_dist:
+                    closest_ghost_dist = dist
+                    closest_ghost_pos = ghost_pos
+                
+                # Mark ghost position as danger if close
                 if dist <= 2:
                     dangers.add(ghost_pos)
+                
+                # Consider ghost "nearby" if within 6 steps
+                if dist <= 6:
+                    ghost_nearby = True
         
-        return dangers
+        return dangers, ghost_nearby, closest_ghost_pos
