@@ -32,11 +32,10 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.2.3, by Jorge and Oriol
+    """LaPulga v0.3.0, by Jorge and Oriol
     
-    MAIN FIX: When scared, retreat to enemy base instead of chasing invader (which can eat us).
-    Also, when food is 2, we return home instead of risking more food collection (no reward).
-    Increased "return" threshold to 4 food carried.
+    MAIN IDEA: Our agent (same brain) now decides whether to focus on upper or lower half,
+    which leads to totally different plays compared to our previous versions.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -106,6 +105,19 @@ class SituationAnalyzer:
         # Upper/lower half (y-axis)
         midline_y = walls.height // 2
         situation.vertical_half = 'upper' if agent_pos[1] >= midline_y else 'lower'
+        
+        # Teammate position and vertical split
+        teammates = [game_state.get_agent_state(i) for i in agent.get_team(game_state) if i != agent.index]
+        if teammates and teammates[0].get_position() is not None:
+            teammate_pos = teammates[0].get_position()
+            situation.teammate_pos = teammate_pos
+            situation.teammate_vertical_half = 'upper' if teammate_pos[1] >= midline_y else 'lower'
+            # Determine which agent should focus on upper vs lower
+            situation.should_focus_upper = agent_pos[1] >= teammate_pos[1]
+        else:
+            situation.teammate_pos = None
+            situation.teammate_vertical_half = None
+            situation.should_focus_upper = None
         
         # Player counts
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
@@ -197,6 +209,10 @@ class Situation:
         self.court_half = 'own'  # 'own' or 'opponent'
         self.vertical_half = 'lower'  # 'upper' or 'lower'
         
+        self.teammate_pos = None
+        self.teammate_vertical_half = None
+        self.should_focus_upper = None  # True if this agent should focus on upper half
+        
         self.enemies_alive = 0
         self.teammates_alive = 0
         self.in_spawn_zone = False
@@ -278,7 +294,7 @@ class StrategySelector:
         #If carrying food and either:
         #   - carrying >= 3 food, or
         #   - carrying > 0 and time is running out (< 150 turns)
-        if situation.carrying_food >= 4:
+        if situation.carrying_food >= 5:
             return 'return'
         
         if situation.carrying_food > 0 and situation.time_remaining < 150:
@@ -335,10 +351,32 @@ class GoalChooser:
     
     # Drafting goal strategies
     def _goal_attack(self, game_state, agent, situation):
-        """Attack strategy: Go for closest food."""
-        if situation.closest_food_pos:
-            return situation.closest_food_pos
-        return agent.start
+        """Attack strategy: Go for closest food, preferring food in assigned territory."""
+        if not situation.closest_food_pos:
+            return agent.start
+        
+        food_list = agent.get_food(game_state).as_list()
+        
+        # If we have teammate position info, divide territory to avoid conflicts
+        if situation.should_focus_upper is not None and len(food_list) > 1:
+            # Split food into upper and lower halves
+            walls = game_state.get_walls()
+            midline_y = walls.height // 2
+            
+            # Partition food based on vertical position
+            if situation.should_focus_upper:
+                # This agent focuses on upper half
+                assigned_food = [f for f in food_list if f[1] >= midline_y]
+            else:
+                # This agent focuses on lower half
+                assigned_food = [f for f in food_list if f[1] < midline_y]
+            
+            # If we have food in our assigned territory, go for closest in that territory
+            if assigned_food:
+                return min(assigned_food, key=lambda f: agent.get_maze_distance(situation.agent_pos, f))
+        
+        # Fallback: go for globally closest food
+        return situation.closest_food_pos
     
     def _goal_defend(self, game_state, agent, situation):
         """Defend strategy: Go for closest visible invader."""
