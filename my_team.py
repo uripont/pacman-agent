@@ -32,10 +32,11 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.2.2, by Jorge and Oriol
+    """LaPulga v0.2.3, by Jorge and Oriol
     
-    MAIN FIX: Fixed return home goal calculation. Previously got stuck on the boundary,
-    now correctly goes to the left/right side depending on team color (tested in blue team).
+    MAIN FIX: When scared, retreat to enemy base instead of chasing invader (which can eat us).
+    Also, when food is 2, we return home instead of risking more food collection (no reward).
+    Increased "return" threshold to 4 food carried.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -160,6 +161,11 @@ class SituationAnalyzer:
                                    if not e.is_pacman and e.get_position() is not None and e.scared_timer > 0]
         situation.has_scared_ghosts = len(situation.scared_ghosts) > 0
         
+        # Our scared state (we are a pacman and have scared timer)
+        agent_state = game_state.get_agent_state(agent.index)
+        situation.we_are_scared = agent_state.is_pacman and agent_state.scared_timer > 0
+        situation.scared_timer_remaining = agent_state.scared_timer if situation.we_are_scared else 0
+        
         return situation
     
     # Helpers (that we have from v0.1.0) -----
@@ -212,6 +218,9 @@ class Situation:
         
         self.scared_ghosts = []
         self.has_scared_ghosts = False
+        
+        self.we_are_scared = False
+        self.scared_timer_remaining = 0
 
 
 ###########################
@@ -243,7 +252,7 @@ class StrategySelector:
         Select strategy for this situation, checking patches first.
         
         Returns:
-            str: strategy name ('attack', 'defend', 'return', 'scout', etc.)
+            str: strategy name ('attack', 'defend', 'return', etc.)
         """
         # Check patches first (specific play tuning)
         for patch_name, (condition_fn, strategy_fn) in self.patches.items():
@@ -258,6 +267,10 @@ class StrategySelector:
         Default strategy selection based on situation.
         This is the general behavior that patches improve upon.
         """
+        # If we are scared and would be in defend mode, retreat to enemy base instead
+        if situation.we_are_scared and situation.has_invaders_visible and situation.on_own_side:
+            return 'scare_retreat'
+        
         # If there are visible invaders and we're on our side, defend
         if situation.has_invaders_visible and situation.on_own_side:
             return 'defend'
@@ -265,10 +278,15 @@ class StrategySelector:
         #If carrying food and either:
         #   - carrying >= 3 food, or
         #   - carrying > 0 and time is running out (< 150 turns)
-        if situation.carrying_food >= 3:
+        if situation.carrying_food >= 4:
             return 'return'
         
         if situation.carrying_food > 0 and situation.time_remaining < 150:
+            return 'return'
+        
+        # Always: when food is 2, we can return: picking more food is risky and does not bring reward
+        # (game ends when all food except 2 at most is eaten)
+        if situation.carrying_food > 0 and situation.food_remaining <= 2:
             return 'return'
         
         # Scared ghosts on opponent side? Go attack them
@@ -308,8 +326,8 @@ class GoalChooser:
         elif strategy == 'hunt_scared':
             return self._goal_hunt_scared(game_state, agent, situation)
         
-        elif strategy == 'scout':
-            return self._goal_scout(game_state, agent, situation)
+        elif strategy == 'scare_retreat':
+            return self._goal_scare_retreat(game_state, agent, situation)
         
         else:
             # Default fallback
@@ -367,11 +385,29 @@ class GoalChooser:
         # Fallback to attack if no scared ghosts visible
         return self._goal_attack(game_state, agent, situation)
     
-    def _goal_scout(self, game_state, agent, situation):
-        """Scout strategy: Move toward food to explore the map."""
-        if situation.closest_food_pos:
-            return situation.closest_food_pos
-        return agent.start
+    def _goal_scare_retreat(self, game_state, agent, situation):
+        """Scare retreat strategy: Move towards enemy base to avoid phantoms while scared."""
+        walls = game_state.get_walls()
+        
+        # Move towards enemy base (opposite of home)
+        if game_state.is_on_red_team(agent.index):
+            # Red team's enemy base is right side (x=walls.width-1 area)
+            target_x = walls.width - 1
+        else:
+            # Blue team's enemy base is left side (x=0 area)
+            target_x = 0
+        
+        valid_targets = []
+        for y in range(walls.height):
+            if not walls[target_x][y]:
+                valid_targets.append((target_x, y))
+        
+        if valid_targets:
+            return min(valid_targets, 
+                      key=lambda pos: agent.get_maze_distance(situation.agent_pos, pos))
+        
+        # Fallback to attack if no valid target
+        return self._goal_attack(game_state, agent, situation)
 
 
 ###########################
