@@ -6,12 +6,10 @@
 # John DeNero (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
 # For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
 
-import random
 import contest.util as util
 
 from contest.capture_agents import CaptureAgent
 from contest.game import Directions
-from contest.util import nearest_point
 
 #################
 # Team creation #
@@ -32,10 +30,9 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.0, by Jorge and Oriol
+    """LaPulga v0.4.1, by Jorge and Oriol
     
-    MAIN IDEA: Now detects corridors and avoids unsafe food in them. When being chased,
-    avoids entering corridors that could trap us leading to dead-ends / easy kills.
+    MAIN FIX: Removed all fields and imports that were not used in this latest version.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -53,9 +50,6 @@ class LaPulga(CaptureAgent):
         
         # State vars
         self.start = None
-        self.situation = None
-        self.strategy = None
-        self.goal = None
         
         # Initialize layers
         self.situation_analyzer = SituationAnalyzer()
@@ -97,70 +91,35 @@ class SituationAnalyzer:
         situation.agent_pos = agent_pos
         situation.on_own_side = not game_state.get_agent_state(agent.index).is_pacman
         
-        # Court halves
-        walls = game_state.get_walls()
-        midline_x = (walls.width - 1) // 2
-        situation.court_half = 'own' if agent_pos[0] < midline_x else 'opponent'
-        
         # Upper/lower half (y-axis)
+        walls = game_state.get_walls()
         midline_y = walls.height // 2
-        situation.vertical_half = 'upper' if agent_pos[1] >= midline_y else 'lower'
         
         # Teammate position and vertical split
         teammates = [game_state.get_agent_state(i) for i in agent.get_team(game_state) if i != agent.index]
         if teammates and teammates[0].get_position() is not None:
             teammate_pos = teammates[0].get_position()
-            situation.teammate_pos = teammate_pos
-            situation.teammate_vertical_half = 'upper' if teammate_pos[1] >= midline_y else 'lower'
             # Determine which agent should focus on upper vs lower
             situation.should_focus_upper = agent_pos[1] >= teammate_pos[1]
         else:
-            situation.teammate_pos = None
-            situation.teammate_vertical_half = None
             situation.should_focus_upper = None
         
-        # Player counts
+        # Player counts and enemies list
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
-        teammates = [game_state.get_agent_state(i) for i in agent.get_team(game_state) if i != agent.index]
-        
-        situation.enemies_alive = sum(1 for e in enemies if e.get_position() is not None)
-        situation.teammates_alive = sum(1 for t in teammates if t.get_position() is not None)
-        
-        # Spawn zone check (near start position)
-        situation.in_spawn_zone = agent.get_maze_distance(agent_pos, agent.start) < 5
         
         # Food information
         food_list = self._get_food_list(game_state, agent)
         situation.food_remaining = len(food_list)
         
         if food_list:
-            closest_food_dist = min(agent.get_maze_distance(agent_pos, food) for food in food_list)
-            situation.closest_food_distance = closest_food_dist
             closest_food = min(food_list, key=lambda f: agent.get_maze_distance(agent_pos, f))
             situation.closest_food_pos = closest_food
         else:
-            situation.closest_food_distance = float('inf')
             situation.closest_food_pos = None
         
         # Enemy proximity
         situation.visible_invaders = self._get_visible_invaders(game_state, agent)
         situation.has_invaders_visible = len(situation.visible_invaders) > 0
-        
-        if situation.visible_invaders:
-            closest_invader_dist = min(agent.get_maze_distance(agent_pos, inv) for inv in situation.visible_invaders)
-            situation.closest_invader_distance = closest_invader_dist
-        else:
-            situation.closest_invader_distance = float('inf')
-        
-        # Pellet information (power pellets)
-        situation.capsules = agent.get_capsules(game_state)
-        situation.has_capsules = len(situation.capsules) > 0
-        
-        if situation.capsules:
-            closest_capsule_dist = min(agent.get_maze_distance(agent_pos, cap) for cap in situation.capsules)
-            situation.closest_capsule_distance = closest_capsule_dist
-        else:
-            situation.closest_capsule_distance = float('inf')
         
         # Carrying food info
         situation.carrying_food = self._get_carrying_food(game_state, agent)
@@ -191,7 +150,6 @@ class SituationAnalyzer:
         # Our scared state (we are a pacman and have scared timer)
         agent_state = game_state.get_agent_state(agent.index)
         situation.we_are_scared = agent_state.is_pacman and agent_state.scared_timer > 0
-        situation.scared_timer_remaining = agent_state.scared_timer if situation.we_are_scared else 0
         
         return situation
     
