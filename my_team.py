@@ -16,7 +16,7 @@ from contest.game import Directions
 #################
 
 def create_team(first_index, second_index, is_red,
-                first='LaPulga', second='LaPulga', num_training=0):
+                first='LaPulga', second='LaPulga', num_training=0): # We use our LaPulga agent for both slots
     """
     This function should return a list of two agents that will form the
     team, initialized using firstIndex and secondIndex as their agent
@@ -30,14 +30,13 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.1, by Jorge and Oriol
+    """LaPulga v0.4.2, by Jorge and Oriol
     
-    MAIN FIX: Removed all fields and imports that were not used in this latest version.
+    MAIN FIX: Removed patch system to have strategy selection only.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
-    2. Strategy: Maps situations to modes (Attack, Defend, Return, Hunt scared)
-       - Supports patches for specific plays/tuning
+    2. Strategy: Maps certain attributes of the situation to a strategy mode
     3. Goal: Chooses target position based on strategy
     4. Pathfinding: A* to find optimal path to goal
        - Avoids walls and dangerous ghosts
@@ -108,7 +107,7 @@ class SituationAnalyzer:
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
         
         # Food information
-        food_list = self._get_food_list(game_state, agent)
+        food_list = agent.get_food(game_state).as_list()
         situation.food_remaining = len(food_list)
         
         if food_list:
@@ -122,10 +121,10 @@ class SituationAnalyzer:
         situation.has_invaders_visible = len(situation.visible_invaders) > 0
         
         # Carrying food info
-        situation.carrying_food = self._get_carrying_food(game_state, agent)
+        situation.carrying_food = game_state.get_agent_state(agent.index).num_carrying
         
         # Time remaining
-        situation.time_remaining = self._get_time_remaining(game_state)
+        situation.time_remaining = game_state.data.timeleft
         
         # Scared ghosts (enemies under pellet effect)
         situation.scared_ghosts = [e for e in enemies 
@@ -153,26 +152,13 @@ class SituationAnalyzer:
         
         return situation
     
-    # Helpers (that we have from v0.1.0) -----
-    def _get_carrying_food(self, game_state, agent):
-        """Get the amount of food currently being carried by this agent."""
-        return game_state.get_agent_state(agent.index).num_carrying
-
-    def _get_time_remaining(self, game_state):
-        """Get remaining game time."""
-        return game_state.data.timeleft
-
-    def _get_food_list(self, game_state, agent):
-        """Get the list of food dots on the opponent's side."""
-        food = agent.get_food(game_state)
-        return food.as_list()
-
     def _get_visible_invaders(self, game_state, agent):
         """Get list of visible enemy Pacman (invaders) positions."""
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
         invaders = [enemy.get_position() for enemy in enemies 
                    if enemy.is_pacman and enemy.get_position() is not None]
         return invaders
+
 
 
 class Situation:
@@ -222,72 +208,21 @@ class Situation:
 ###########################
 
 class StrategySelector:
-    """
-    Maps situations to strategies, with support for patches.
-    A "patch" is a override for certain "rehearsed plays" detected in the situation.
-    """
-    
-    def __init__(self):
-        self.patches = {}
-    
-    def add_patch(self, patch_name, patch_condition_fn, patch_strategy_fn):
-        """
-        Add a patch that overrides strategy selection for specific situations.
-        
-        Args:
-            patch_name: Unique identifier for this patch
-            patch_condition_fn: callable(situation) -> bool
-            patch_strategy_fn: callable(situation) -> str (strategy name)
-        """
-        self.patches[patch_name] = (patch_condition_fn, patch_strategy_fn)
-    
+    """Select strategy based on attribute combination of the current situation."""
+
     def select_strategy(self, situation):
-        """
-        Select strategy for this situation, checking patches first.
-        
-        Returns:
-            str: strategy name ('attack', 'defend', 'return', etc.)
-        """
-        # Check patches first (specific play tuning)
-        for patch_name, (condition_fn, strategy_fn) in self.patches.items():
-            if condition_fn(situation):
-                return strategy_fn(situation)
-        
-        # Default strategy selection logic, draft for now
-        return self._default_strategy(situation)
-    
-    def _default_strategy(self, situation):
-        """
-        Default strategy selection based on situation.
-        This is the general behavior that patches improve upon.
-        """
-        # If we are scared and would be in defend mode, retreat to enemy base instead
         if situation.we_are_scared and situation.has_invaders_visible and situation.on_own_side:
             return 'scare_retreat'
-        
-        # If there are visible invaders and we're on our side, defend
         if situation.has_invaders_visible and situation.on_own_side:
             return 'defend'
-        
-        #If carrying food and either:
-        #   - carrying >= 3 food, or
-        #   - carrying > 0 and time is running out (< 150 turns)
-        if situation.carrying_food >= 5:
+        if situation.carrying_food >= 5: # Threshold to return with food
             return 'return'
-        
-        if situation.carrying_food > 0 and situation.time_remaining < 150:
+        if situation.carrying_food > 0 and situation.time_remaining < 150: # Come back when time is low
             return 'return'
-        
-        # Always: when food is 2, we can return: picking more food is risky and does not bring reward
-        # (game ends when all food except 2 at most is eaten)
-        if situation.carrying_food > 0 and situation.food_remaining <= 2:
+        if situation.carrying_food > 0 and situation.food_remaining <= 2: # Ignore last 2 food
             return 'return'
-        
-        # Scared ghosts on opponent side? Go attack them
         if situation.has_scared_ghosts and not situation.on_own_side:
             return 'hunt_scared'
-        
-        # Default attack
         return 'attack'
 
 
@@ -302,30 +237,16 @@ class GoalChooser:
     """
     
     def choose_goal(self, game_state, agent, situation, strategy):
-        """
-        Choose the goal position for the current turn.
-        
-        Returns:
-            (x, y) position to move toward
-        """
         if strategy == 'attack':
             return self._goal_attack(game_state, agent, situation)
-        
         elif strategy == 'defend':
             return self._goal_defend(game_state, agent, situation)
-        
         elif strategy == 'return':
             return self._goal_return(game_state, agent, situation)
-        
         elif strategy == 'hunt_scared':
             return self._goal_hunt_scared(game_state, agent, situation)
-        
-        elif strategy == 'scare_retreat':
+        else:  # strategy == 'scare_retreat':
             return self._goal_scare_retreat(game_state, agent, situation)
-        
-        else:
-            # Default fallback
-            return agent.start
     
     # Drafting goal strategies
     def _goal_attack(self, game_state, agent, situation):
