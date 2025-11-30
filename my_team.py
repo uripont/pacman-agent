@@ -32,12 +32,10 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.2.1, by Jorge and Oriol
+    """LaPulga v0.2.2, by Jorge and Oriol
     
-    MAIN FIX: Fixed spawn exiting. Previously, agents would get stuck in spawn zone, 
-    the pathfinder returned no path and the agent would do the fallback (random move).
-    To detect these cases, fallback is now STOP. Also, pathfinder path length limit 
-    increased to 200 (20 wasn't enough).
+    MAIN FIX: Fixed return home goal calculation. Previously got stuck on the boundary,
+    now correctly goes to the left/right side depending on team color (tested in blue team).
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -82,6 +80,7 @@ class LaPulga(CaptureAgent):
                 return path[0]
         
         # Fallback: return STOP to make issues visible
+        # TODO: NEVER should use fallback, only for debugging
         return Directions.STOP
 
 
@@ -334,7 +333,16 @@ class GoalChooser:
     def _goal_return(self, game_state, agent, situation):
         """Return strategy: Go to closest home entry point."""
         walls = game_state.get_walls()
-        boundary_x = (walls.width - 1) // 2
+        
+        # We previously incorrectly divided walls.width - 1 by 2, getting stuck in the boundary
+        # Red team: home is left side (x=0 area)
+        # Blue team: home is right side (x=walls.width-1 area)
+        if game_state.is_on_red_team(agent.index):
+            # Red team returns to left side
+            boundary_x = 0
+        else:
+            # Blue team returns to right side
+            boundary_x = walls.width - 1
         
         valid_entries = []
         for y in range(walls.height):
