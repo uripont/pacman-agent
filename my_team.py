@@ -30,9 +30,9 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.3, by Jorge and Oriol
+    """LaPulga v0.4.4, by Jorge and Oriol
     
-    MAIN FIX: Simplified Pathfinder logic and readability.
+    MAIN FIX: Removed unused situation attributes, and unneeded safe food computation in attack goal.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -66,11 +66,9 @@ class LaPulga(CaptureAgent):
         self.situation = self.situation_analyzer.analyze(game_state, self)
         self.strategy = self.strategy_selector.select_strategy(self.situation)
         self.goal = self.goal_chooser.choose_goal(game_state, self, self.situation, self.strategy)
-
-        if self.goal:
-            path = self.path_finder.search(game_state, self, self.goal)
-            if path:
-                return path[0]
+        path = self.path_finder.search(game_state, self, self.goal)
+        if path:
+            return path[0]
         
         # Fallback: return STOP to make issues visible
         # TODO: NEVER should use fallback, only for debugging
@@ -165,28 +163,13 @@ class Situation:
     def __init__(self):
         self.agent_pos = None
         self.on_own_side = True
-        self.court_half = 'own'  # 'own' or 'opponent'
-        self.vertical_half = 'lower'  # 'upper' or 'lower'
-        
-        self.teammate_pos = None
-        self.teammate_vertical_half = None
-        self.should_focus_upper = None  # True if this agent should focus on upper half
-        
-        self.enemies_alive = 0
-        self.teammates_alive = 0
-        self.in_spawn_zone = False
+        self.should_focus_upper = None
         
         self.food_remaining = 0
-        self.closest_food_distance = float('inf')
         self.closest_food_pos = None
         
         self.visible_invaders = []
         self.has_invaders_visible = False
-        self.closest_invader_distance = float('inf')
-        
-        self.capsules = []
-        self.has_capsules = False
-        self.closest_capsule_distance = float('inf')
         
         self.carrying_food = 0
         self.time_remaining = 0
@@ -200,7 +183,6 @@ class Situation:
         self.closest_dangerous_ghost_pos = None
         
         self.we_are_scared = False
-        self.scared_timer_remaining = 0
 
 
 ###########################
@@ -248,12 +230,8 @@ class GoalChooser:
         else:  # strategy == 'scare_retreat':
             return self._goal_scare_retreat(game_state, agent, situation)
     
-    # Drafting goal strategies
     def _goal_attack(self, game_state, agent, situation):
-        """Attack strategy: Go for closest food, preferring safe food when ghost is nearby."""
-        if not situation.closest_food_pos:
-            return agent.start
-        
+        """Attack strategy: Go for closest food, preferring safe food when ghost is nearby."""        
         food_list = agent.get_food(game_state).as_list()
         
         # If we have teammate position info, divide territory to avoid conflicts
@@ -264,13 +242,10 @@ class GoalChooser:
             
             # Partition food based on vertical position
             if situation.should_focus_upper:
-                # This agent focuses on upper half
                 assigned_food = [f for f in food_list if f[1] >= midline_y]
             else:
-                # This agent focuses on lower half
                 assigned_food = [f for f in food_list if f[1] < midline_y]
             
-            # If we have food in our assigned territory, use that list
             if assigned_food:
                 food_list = assigned_food
         
@@ -286,11 +261,9 @@ class GoalChooser:
                                               situation.agent_pos, ghost_pos)]
             
             if safe_food:
-                # Pick closest safe food
                 return min(safe_food, key=lambda f: agent.get_maze_distance(situation.agent_pos, f))
             else:
-                # No safe food! Switch to return mode or find escape route
-                # Return to home boundary for safety
+                # No safe food, return to home boundary for safety
                 return self._goal_return(game_state, agent, situation)
         
         # No immediate danger, go for closest food
@@ -304,42 +277,14 @@ class GoalChooser:
         if food_pos not in corridor_positions:
             return True
         
-        # Food is in a corridor - check if we could escape after eating it
-        walls = game_state.get_walls()
-        visited = {food_pos}
-        current = food_pos
+        # Food is in a corridor: compare distances to determine if we can escape
+        # We need to reach the food and get out before the ghost catches us
+        dist_agent_to_food = agent.get_maze_distance(agent_pos, food_pos)
+        dist_ghost_to_food = agent.get_maze_distance(ghost_pos, food_pos)
         
-        for _ in range(10):  # Max corridor length
-            neighbors = []
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nx, ny = current[0] + dx, current[1] + dy
-                if 0 <= nx < walls.width and 0 <= ny < walls.height:
-                    if not walls[nx][ny] and (nx, ny) not in visited:
-                        neighbors.append((nx, ny))
-            
-            if not neighbors:
-                break
-            
-            # Count exits of current position
-            exits = sum(1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
-                       if 0 <= current[0]+dx < walls.width and 0 <= current[1]+dy < walls.height
-                       and not walls[current[0]+dx][current[1]+dy])
-            
-            if exits > 2:  # Found junction (corridor exit)
-                dist_agent_to_food = agent.get_maze_distance(agent_pos, food_pos)
-                dist_food_to_exit = agent.get_maze_distance(food_pos, current)
-                dist_ghost_to_exit = agent.get_maze_distance(ghost_pos, current)
-                
-                agent_total_dist = dist_agent_to_food + dist_food_to_exit
-                if dist_ghost_to_exit <= agent_total_dist + 2:
-                    return False  # Ghost could cut us off
-                return True
-            
-            visited.add(neighbors[0])
-            current = neighbors[0]
-        
-        # Couldn't find exit, assume unsafe if ghost is close
-        return agent.get_maze_distance(agent_pos, ghost_pos) > 5
+        # Safe if we can reach the food much before the ghost
+        # (margin of 2 to account for exiting the corridor)
+        return dist_ghost_to_food > dist_agent_to_food + 2
     
     def _goal_defend(self, game_state, agent, situation):
         """Defend strategy: Go for closest visible invader."""
@@ -369,8 +314,7 @@ class GoalChooser:
                 valid_entries.append((boundary_x, y))
         
         if valid_entries:
-            return min(valid_entries, 
-                      key=lambda pos: agent.get_maze_distance(situation.agent_pos, pos))
+            return min(valid_entries, key=lambda pos: agent.get_maze_distance(situation.agent_pos, pos))
         
         return agent.start
     
