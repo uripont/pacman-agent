@@ -6,10 +6,10 @@
 # John DeNero (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
 # For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
 
-import contest.util as util
+import util as util
 
-from contest.capture_agents import CaptureAgent
-from contest.game import Directions
+from capture_agents import CaptureAgent
+from game import Directions
 
 #################
 # Team creation #
