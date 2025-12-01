@@ -30,9 +30,9 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.4, by Jorge and Oriol
+    """LaPulga v0.4.5, by Jorge and Oriol
     
-    MAIN FIX: Removed unused situation attributes, and unneeded safe food computation in attack goal.
+    MAIN FIX: Threshold is a bit higher, more aggressive.
     
     CURRENT APPROACH: Four-layer decision system:
     1. Situation: Detects game state (position, food, threats, etc.)
@@ -197,7 +197,7 @@ class StrategySelector:
             return 'scare_retreat'
         if situation.has_invaders_visible and situation.on_own_side:
             return 'defend'
-        if situation.carrying_food >= 5: # Threshold to return with food
+        if situation.carrying_food >= 6: # Threshold to return with food
             return 'return'
         if situation.carrying_food > 0 and situation.time_remaining < 150: # Come back when time is low
             return 'return'
