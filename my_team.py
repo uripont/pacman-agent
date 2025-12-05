@@ -30,25 +30,37 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.5, by Jorge and Oriol
+    """LaPulga v0.4.6, by Jorge and Oriol
     
-    MAIN FIX: Threshold is a bit higher, more aggressive.
+
     
     CURRENT APPROACH: Four-layer decision system:
-    1. Situation: Detects game state (position, food, threats, etc.)
+    1. Situation: Detects game state (position, food, threats, scared state, etc.)
     2. Strategy: Maps certain attributes of the situation to a strategy mode
+       - 'scare_retreat' when we're scared ghosts being pursued by invaders
     3. Goal: Chooses target position based on strategy
     4. Pathfinding: A* to find optimal path to goal
-       - Avoids walls and dangerous ghosts
+       - Avoids walls and dangerous enemies (ghosts when attacking, invaders when scared)
        - Heuristic is Manhattan distance
+    5. Fallback: When no path exists, detects if stuck and sacrifices if losing
+        
+    NEW FIX: Stuck detection and strategic sacrifice 
+    NEW FIX: Improved scared ghost behavior 
     """
     
+    # Set to True to see debug output about scared retreat behavior and stuck detection
+    DEBUG = True  # Enabled to debug stuck detection
     
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
         
         # State vars
         self.start = None
+        
+        # Stuck detection (for fallback suicide mechanism)
+        self.consecutive_stops = 0
+        self.last_position = None
+        self.position_history = []  # Track last N positions to detect oscillation
         
         # Initialize layers
         self.situation_analyzer = SituationAnalyzer()
@@ -60,6 +72,90 @@ class LaPulga(CaptureAgent):
         self.start = game_state.get_agent_position(self.index)
         CaptureAgent.register_initial_state(self, game_state)
         
+    def _should_sacrifice(self, game_state):
+        """Determine if we should sacrifice ourselves when stuck.
+        
+        Only sacrifice if we're losing or tied. If winning, staying stuck is good.
+        """
+        score = game_state.get_score()
+        
+        # Adjust score based on team (red team has positive score when winning)
+        if not game_state.is_on_red_team(self.index):
+            score = -score
+        
+        # Sacrifice if we're losing or tied
+        # If score > 0, we're winning, so don't sacrifice
+        return score <= 0
+    
+    def _get_suicide_action(self, game_state):
+        """Get an action that moves us towards the nearest enemy (to get killed).
+        
+        This breaks stalemates where we're stuck in a corridor.
+        """
+        current_pos = game_state.get_agent_position(self.index)
+        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
+        
+        # Find nearest visible enemy
+        visible_enemies = [e for e in enemies if e.get_position() is not None]
+        if not visible_enemies:
+            # No visible enemies, just try to move in any valid direction
+            return self._get_any_valid_action(game_state)
+        
+        # Get closest enemy position
+        enemy_positions = [e.get_position() for e in visible_enemies]
+        closest_enemy = min(enemy_positions, 
+                          key=lambda pos: self.get_maze_distance(current_pos, pos))
+        
+        # Find the action that moves us closest to the enemy
+        legal_actions = game_state.get_legal_actions(self.index)
+        if Directions.STOP in legal_actions:
+            legal_actions.remove(Directions.STOP)  # Don't stay still
+        
+        if not legal_actions:
+            return Directions.STOP
+        
+        # Choose action that minimizes distance to enemy
+        best_action = None
+        best_dist = float('inf')
+        
+        for action in legal_actions:
+            successor = game_state.generate_successor(self.index, action)
+            new_pos = successor.get_agent_position(self.index)
+            dist = self.get_maze_distance(new_pos, closest_enemy)
+            
+            if dist < best_dist:
+                best_dist = dist
+                best_action = action
+        
+        return best_action if best_action else Directions.STOP
+    
+    def _get_any_valid_action(self, game_state):
+        """Get any valid action when we can't see enemies."""
+        legal_actions = game_state.get_legal_actions(self.index)
+        if Directions.STOP in legal_actions:
+            legal_actions.remove(Directions.STOP)
+        
+        return legal_actions[0] if legal_actions else Directions.STOP
+    
+    def _is_oscillating(self):
+        """Detect if agent is oscillating in a small area (trapped but moving).
+        
+        Returns True if all positions in history are within a small radius.
+        """
+        if len(self.position_history) < 8:  # Reduced from 10 for faster detection
+            return False
+        
+        # Calculate the bounding box of recent positions
+        x_coords = [pos[0] for pos in self.position_history]
+        y_coords = [pos[1] for pos in self.position_history]
+        
+        x_range = max(x_coords) - min(x_coords)
+        y_range = max(y_coords) - min(y_coords)
+        
+        # If moving in area smaller than 2x2, we're oscillating/trapped
+        OSCILLATION_THRESHOLD = 2  # Reduced from 3 for more aggressive detection
+        return x_range <= OSCILLATION_THRESHOLD and y_range <= OSCILLATION_THRESHOLD
+        
         
     # The high-level decision algorithm
     def choose_action(self, game_state):
@@ -67,11 +163,61 @@ class LaPulga(CaptureAgent):
         self.strategy = self.strategy_selector.select_strategy(self.situation)
         self.goal = self.goal_chooser.choose_goal(game_state, self, self.situation, self.strategy)
         path = self.path_finder.search(game_state, self, self.goal)
+        
+        current_pos = game_state.get_agent_position(self.index)
+        
+        # Update position history for oscillation detection
+        self.position_history.append(current_pos)
+        if len(self.position_history) > 10:  # Keep last 10 positions
+            self.position_history.pop(0)
+        
         if path:
+            # Reset stuck counter when we have a valid path
+            self.consecutive_stops = 0
+            self.last_position = current_pos
             return path[0]
         
-        # Fallback: return STOP to make issues visible
-        # TODO: NEVER should use fallback, only for debugging
+        # No path found - we're in fallback mode
+        # Check if we're stuck (not moving for multiple turns)
+        if current_pos == self.last_position:
+            self.consecutive_stops += 1
+        else:
+            self.consecutive_stops = 0
+        
+        self.last_position = current_pos
+        
+        # STUCK DETECTION: Check both STOP and oscillation patterns
+        STUCK_THRESHOLD = 5
+        is_stuck = False
+        
+        # Method 1: Consecutive STOPs
+        if self.consecutive_stops >= STUCK_THRESHOLD:
+            is_stuck = True
+            if self.DEBUG:
+                print(f"Agent {self.index}: Detected STUCK (consecutive STOPs: {self.consecutive_stops})")
+        
+        # Method 2: Oscillating in small area (moving back and forth)
+        if len(self.position_history) >= 8:  # Match the threshold in _is_oscillating
+            if self._is_oscillating():
+                is_stuck = True
+                if self.DEBUG:
+                    print(f"Agent {self.index}: Detected STUCK (oscillating in small area)")
+        
+        if is_stuck:
+            # Check if we should sacrifice ourselves
+            if self._should_sacrifice(game_state):
+                # Force suicide by moving towards nearest enemy
+                suicide_action = self._get_suicide_action(game_state)
+                if suicide_action:
+                    if self.DEBUG:
+                        print(f"Agent {self.index}: SACRIFICING (losing game, score: {game_state.get_score()})")
+                    return suicide_action
+            else:
+                # We're winning, staying stuck is good for us
+                if self.DEBUG:
+                    print(f"Agent {self.index}: STUCK but WINNING (score: {game_state.get_score()}) - staying put")
+        
+        # Fallback: return STOP
         return Directions.STOP
 
 
@@ -144,9 +290,9 @@ class SituationAnalyzer:
             situation.closest_dangerous_ghost_distance = float('inf')
             situation.closest_dangerous_ghost_pos = None
         
-        # Our scared state (we are a pacman and have scared timer)
+        # Our scared state (when enemy eats power capsule, we become scared ghosts)
         agent_state = game_state.get_agent_state(agent.index)
-        situation.we_are_scared = agent_state.is_pacman and agent_state.scared_timer > 0
+        situation.we_are_scared = agent_state.scared_timer > 0
         
         return situation
     
@@ -331,28 +477,56 @@ class GoalChooser:
         return self._goal_attack(game_state, agent, situation)
     
     def _goal_scare_retreat(self, game_state, agent, situation):
-        """Scare retreat strategy: Move towards enemy base to avoid phantoms while scared."""
+        """Scare retreat strategy: Run away from enemy invaders when we're scared."""
+        if not situation.visible_invaders:
+            # No visible invaders, just stay safe near our spawn
+            return agent.start
+        
+        # Find a safe position that maximizes distance from all invaders
         walls = game_state.get_walls()
         
-        # Move towards enemy base (opposite of home)
-        if game_state.is_on_red_team(agent.index):
-            # Red team's enemy base is right side (x=walls.width-1 area)
-            target_x = walls.width - 1
-        else:
-            # Blue team's enemy base is left side (x=0 area)
-            target_x = 0
+        # Get all valid positions on our side
+        valid_positions = []
+        for x in range(walls.width):
+            for y in range(walls.height):
+                if not walls[x][y]:
+                    pos = (x, y)
+                    # Check if position is on our side
+                    agent_state_at_pos = game_state.get_agent_state(agent.index)
+                    # Use the midline to determine our side
+                    midline_x = walls.width // 2
+                    if game_state.is_on_red_team(agent.index):
+                        on_our_side = x < midline_x
+                    else:
+                        on_our_side = x >= midline_x
+                    
+                    if on_our_side:
+                        valid_positions.append(pos)
         
-        valid_targets = []
-        for y in range(walls.height):
-            if not walls[target_x][y]:
-                valid_targets.append((target_x, y))
+        # Score each position by minimum distance to any invader (we want maximum of this)
+        def score_position(pos):
+            min_dist_to_invader = min(
+                agent.get_maze_distance(pos, inv) 
+                for inv in situation.visible_invaders
+            )
+            # Also consider distance from our current position (don't want to go too far)
+            dist_from_current = agent.get_maze_distance(situation.agent_pos, pos)
+            # Prefer positions far from invaders but not too far from current position
+            return min_dist_to_invader - (dist_from_current * 0.1)
         
-        if valid_targets:
-            return min(valid_targets, 
-                      key=lambda pos: agent.get_maze_distance(situation.agent_pos, pos))
+        # Find the best safe position
+        if valid_positions:
+            # Limit search to nearby positions for performance
+            nearby_positions = [
+                pos for pos in valid_positions 
+                if agent.get_maze_distance(situation.agent_pos, pos) <= 10
+            ]
+            if nearby_positions:
+                best_position = max(nearby_positions, key=score_position)
+                return best_position
         
-        # Fallback to attack if no valid target
-        return self._goal_attack(game_state, agent, situation)
+        # Fallback to spawn point
+        return agent.start
 
 
 ###########################
@@ -470,24 +644,40 @@ class PathFinder:
         closest_ghost_dist = float('inf')
         
         agent_pos = game_state.get_agent_position(agent.index)
+        agent_state = game_state.get_agent_state(agent.index)
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
         
+        # Check if we're scared
+        we_are_scared = agent_state.scared_timer > 0
+        
         for enemy in enemies:
-            # Only consider dangerous ghosts (not pacman, visible, not scared)
-            if enemy.is_pacman or enemy.get_position() is None or enemy.scared_timer > 0:
+            enemy_pos = enemy.get_position()
+            if enemy_pos is None:
                 continue
             
-            ghost_pos = enemy.get_position()
-            dist = agent.get_maze_distance(agent_pos, ghost_pos)
+            # Determine if this enemy is dangerous to us
+            is_dangerous = False
             
-            # Track closest dangerous ghost
+            if we_are_scared and enemy.is_pacman:
+                # When we're scared, enemy pacmen can kill us
+                is_dangerous = True
+            elif not enemy.is_pacman and enemy.scared_timer <= 0:
+                # When we're attacking, non-scared enemy ghosts can kill us
+                is_dangerous = True
+            
+            if not is_dangerous:
+                continue
+            
+            dist = agent.get_maze_distance(agent_pos, enemy_pos)
+            
+            # Track closest dangerous enemy
             if dist < closest_ghost_dist:
                 closest_ghost_dist = dist
-                closest_ghost_pos = ghost_pos
+                closest_ghost_pos = enemy_pos
             
             # Mark as dangerous if very close
             if dist <= 2:
-                dangers.add(ghost_pos)
+                dangers.add(enemy_pos)
             
             # Mark nearby if moderately close
             if dist <= 6:
