@@ -30,39 +30,26 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.7, by Jorge and Oriol
+    """LaPulga v0.4.8, by Jorge and Oriol
     
-    NEW FIX: Inference Defense (Food Memory) - Detects invisible invaders.
-    Tracks disappearing food to infer enemy position. If food is eaten but no enemy is seen,
-    the agent knows an invader is there and moves to intercept. Breaks "Defensive Blindness".
-    This improves the behaviour of our agent on very big layouts as JUMBo
+    NEW STRATEGY: Pincer Defense (Hammer & Anvil)
+    Solves the "Conga Line" issue where two defenders chased the same invader inefficiently.
+    - Primary Defender (The Hammer): The agent closest to the enemy invader pursues directly to kill.
+    - Secondary Defender (The Anvil): The agent further away moves to the boundary/frontier to cut off the enemy's escape route.
     
-    Previous FIX:
-        before: agent treats capsules as invisible unless they are coincidentally on the path to food. We need to upgrade the _goal_attack method in the GoalChooser class.
-    
-        Strategy Change:
-            Emergency Weapon: If a dangerous ghost is nearby (within 6 steps) and a capsule is reachable/safe, drop everything and run for the capsule. This turns a defensive retreat into an offensive kill.
-            Opportunity: If a capsule is very close (within 5 steps), eat it before moving deep into enemy territory.
-        
-            Previously, if you were Attacker and the enemy ran past you, you ignored them. Now, if you are closer to the enemy than your partner,
-            you effectively switch roles instantly to intercept, while your partner (who is further away) takes over the attack.
+    PREVIOUS CRITICAL FIXES (v1.0):
+    1. Inference Defense (Food Memory): BREAKS BLINDNESS in Jumbo maps. Tracks disappearing food to infer invisible enemy positions and moves to investigate.
+    2. Fearless Defense: Fixed a bug where defenders treated non-scared enemy Pacmen as "Dangerous Obstacles" in A*. Now treats them as FOOD targets (Fixes -56 score in fastCapture).
+    3. Anti-Greed Logic: If the path home is blocked while carrying food, switches target to the nearest capsule or evasive maneuvers instead of freezing.
+    4. Jumbo Range: Increased A* search depth to 300 to handle large maps.
 
-
-    PREVIOUS FIX: Stuck detection and strategic sacrifice - prevents stalemates in corridors.
-    When stuck for 5+ turns and losing, agent sacrifices itself to break the deadlock.
-    
-    PREVIOUS FIX: Scared ghost behavior - properly detects and retreats from invaders when scared.
-    
-    CURRENT APPROACH: Four-layer decision system:
-    1. Situation: Detects game state (position, food, threats, scared state, etc.)
-    2. Strategy: Maps certain attributes of the situation to a strategy mode
-       - 'scare_retreat' when we're scared ghosts being pursued by invaders
-    3. Goal: Chooses target position based on strategy
-    4. Pathfinding: A* to find optimal path to goal
-       - Avoids walls and dangerous enemies (ghosts when attacking, invaders when scared)
-       - Heuristic is Manhattan distance
-    5. Fallback: When no path exists, detects if stuck and sacrifices if losing
-
+    CORE ARCHITECTURE:
+    1. Situation: Analyzes game state (visible/inferred threats, food counts, team positions).
+    2. Strategy: Selects high-level mode ('attack', 'defend', 'return', 'scare_retreat').
+       - Now includes 'Recall' logic: attackers return home if a threat is detected.
+    3. Goal: Chooses specific target coordinates based on role (Hammer vs Anvil).
+    4. Pathfinding: A* with dynamic danger avoidance (avoids dead-ends if ghosts are near).
+    5. Fallback: Stuck detection with strategic sacrifice to break stalemates.
     """
     
     # Set to True to see debug output about scared retreat behavior and stuck detection
@@ -353,46 +340,33 @@ class SituationAnalyzer:
         # ---------------------------------------------------------
         team_indices = sorted(agent.get_team(game_state))
         
-        # Default: Lower index is defender (Fallback)
         # NUEVO: Pasar la memoria del agente a la situación
         situation.inferred_invader_pos = agent.memory_invader_pos
         situation.has_inferred_invader = (agent.memory_invader_pos is not None)
         
-        # MODIFICACIÓN DE LA LÓGICA DE DEFENSOR DINÁMICO
-        # Ahora también consideramos ser defensor si hay un enemigo inferido
+        # Definir si hay amenaza en el objeto situation
+        situation.has_threat = situation.has_invaders_visible or situation.has_inferred_invader
+
+        # --- LÓGICA DE ROL DEFENSIVO AVANZADA (MARTILLO Y YUNQUE) ---
+        situation.is_primary_defender = True # Por defecto asumimos que somos el principal
         
-        # 1. ¿Hay amenaza real (visible o inferida)?
-        has_threat = situation.has_invaders_visible or situation.has_inferred_invader
-        
-        if has_threat:
-            # Lógica simple: Si estamos ganando o es mi rol base, defiendo.
-            # O la lógica de distancia que ya tenías, pero adaptada:
-            
-            target_pos = None
-            if situation.visible_invaders:
-                # Prioridad a lo que vemos
-                target_pos = situation.visible_invaders[0] 
-            elif situation.inferred_invader_pos:
-                # Si no vemos nada, usamos la memoria
-                target_pos = situation.inferred_invader_pos
+        if situation.has_threat:
+            target = situation.visible_invaders[0] if situation.visible_invaders else situation.inferred_invader_pos
+            if target and teammate_pos:
+                my_dist = agent.get_maze_distance(agent_pos, target)
+                mate_dist = agent.get_maze_distance(teammate_pos, target)
                 
-            if target_pos and teammate_pos:
-                my_dist = agent.get_maze_distance(agent_pos, target_pos)
-                mate_dist = agent.get_maze_distance(teammate_pos, target_pos)
-                
-                # Histéresis: Solo cambio de rol si la diferencia es clara (> 2 pasos)
-                if my_dist < mate_dist - 2:
-                    situation.is_defender = True
-                elif my_dist > mate_dist + 2:
-                    situation.is_defender = False
-                # Si es igual, mantenemos el rol por defecto (índice)
-            else:
-                # Fallback si no hay compañero vivo o posiciones claras
-                situation.is_defender = True 
-                
+                # Quien esté más cerca es el Defensor Primario (Martillo)
+                if my_dist < mate_dist:
+                    situation.is_primary_defender = True
+                elif my_dist > mate_dist:
+                    situation.is_primary_defender = False
+                else:
+                    # Desempate por índice para evitar que ambos crean ser el secundario
+                    situation.is_primary_defender = (agent.index < team_indices[1]) 
         else:
-            # Sin amenazas, rol por defecto basado en índice
-            situation.is_defender = (agent.index == team_indices[0])
+             # Si no hay amenaza, definimos roles por defecto
+             situation.is_primary_defender = (agent.index == team_indices[0])
 
         return situation
     
@@ -441,38 +415,31 @@ class Situation:
 ###########################
 
 class StrategySelector:
-    """Select strategy based on attribute combination of the current situation."""
-
     def select_strategy(self, situation):
-        # 1. Survival: If we are scared and see invaders, run.
+        # 1. Supervivencia (Prioridad absoluta)
         if situation.we_are_scared and situation.has_invaders_visible and situation.on_own_side:
             return 'scare_retreat'
             
-        # 2. Aggressive Mode (Capsule Eaten): "GO CRAZY AGAINST FOOD"
-        # When ghosts are scared, we ignore them and focus purely on food.
-        # We override return logic to maximize food intake.
+        # 2. Modo Depredador (Comer fantasmas asustados)
         if situation.has_scared_ghosts:
             return 'attack'
             
-        # 3. Return Logic (Standard)
-        if situation.carrying_food >= 6: # Threshold to return with food
+        # 3. Retorno Seguro (Evitar morir cargado de comida)
+        # Bajamos un poco el threshold para asegurar puntos
+        if situation.carrying_food >= 5: 
             return 'return'
-        if situation.carrying_food > 0 and situation.time_remaining < 150: # Come back when time is low
+        if situation.carrying_food > 0 and (situation.time_remaining < 60 or situation.food_remaining <= 2):
             return 'return'
-        if situation.carrying_food > 0 and situation.food_remaining <= 2: # Ignore last 2 food
-            return 'return'
-
-        # 4. NUEVO: Lógica de Defensa Reforzada
-        # Si vemos invasores O intuimos invasores (comida desaparecida), defendemos
-        has_threat = situation.has_invaders_visible or situation.has_inferred_invader
-        
-        if has_threat and situation.on_own_side:
-             return 'defend'
-        
-        # 5. Winning Strategy: Camp with one agent
-        if situation.winning:
-            if situation.is_defender:
-                return 'defend'
+            
+        # 4. DEFENSA REFORZADA (CORRECCIÓN CRÍTICA)
+        # Si hay amenaza, verificamos si nos toca defender AUNQUE estemos fuera
+        if situation.has_threat:
+            if situation.on_own_side: return 'defend'
+            # Si estoy fuera pero soy el primario (el más cercano a la amenaza), vuelvo
+            if situation.is_primary_defender: return 'defend'
+            
+        if situation.winning and situation.is_primary_defender:
+            return 'defend'
         
         return 'attack'
 
@@ -587,18 +554,34 @@ class GoalChooser:
         return dist_ghost_to_target > dist_agent_to_target + 2
 
     def _goal_defend(self, game_state, agent, situation):
-        """Defend strategy: Go for closest visible invader. If none, patrol frontier food."""
-        # 1. Chase visible invaders (Prioridad Máxima)
+        # Objetivo prioritario: Enemigo (Visible > Inferido)
+        target = None
         if situation.visible_invaders:
-            closest_inv = min(situation.visible_invaders, 
-                            key=lambda inv: agent.get_maze_distance(situation.agent_pos, inv))
-            return closest_inv
+            target = min(situation.visible_invaders, key=lambda i: agent.get_maze_distance(situation.agent_pos, i))
+        elif situation.inferred_invader_pos:
+            target = situation.inferred_invader_pos
             
-        # 2. NUEVO: Ir a la última posición conocida donde comieron (Investigar)
-        if situation.inferred_invader_pos:
-            return situation.inferred_invader_pos
+        if target:
+            # TÁCTICA DE PINZA:
+            # Si soy el Primario -> Voy directo al objetivo (Persecución)
+            # Si soy el Secundario -> Voy a bloquear su salida (Intercepción)
             
-        # 2. If we are on enemy side, we need to return home to defend
+            # Excepción: Si estoy muy cerca (<5 pasos), voy a matar siempre (doble ataque)
+            if situation.is_primary_defender or agent.get_maze_distance(situation.agent_pos, target) < 5:
+                return target
+            else:
+                # Lógica de "El Yunque": Ir al punto de frontera más cercano al enemigo
+                walls = game_state.get_walls()
+                mid_x = walls.width // 2
+                boundary_x = mid_x - 1 if game_state.is_on_red_team(agent.index) else mid_x
+                
+                valid_boundary_spots = [(boundary_x, y) for y in range(walls.height) if not walls[boundary_x][y]]
+                if valid_boundary_spots:
+                    # Elegir el punto de frontera que esté más cerca del ENEMIGO, no de mí.
+                    intercept_point = min(valid_boundary_spots, key=lambda p: agent.get_maze_distance(target, p))
+                    return intercept_point
+                return target # Fallback
+
         if not situation.on_own_side:
             return self._goal_return(game_state, agent, situation)
             
@@ -801,41 +784,37 @@ class PathFinder:
         agent_state = game_state.get_agent_state(agent.index)
         enemies = [game_state.get_agent_state(i) for i in agent.get_opponents(game_state)]
         
-        # Check if we're scared
         we_are_scared = agent_state.scared_timer > 0
         
         for enemy in enemies:
             enemy_pos = enemy.get_position()
-            if enemy_pos is None:
-                continue
+            if enemy_pos is None: continue
             
-            # Determine if this enemy is dangerous to us
             is_dangerous = False
             
-            if we_are_scared and enemy.is_pacman:
-                # When we're scared, enemy pacmen can kill us
-                is_dangerous = True
-            elif not enemy.is_pacman and enemy.scared_timer <= 0:
-                # When we're attacking, non-scared enemy ghosts can kill us
-                is_dangerous = True
+            # CASO 1: SOMOS PACMAN (Atacando)
+            if agent_state.is_pacman:
+                # Nos mata cualquier fantasma no asustado
+                if not enemy.is_pacman and enemy.scared_timer <= 0:
+                    is_dangerous = True
             
+            # CASO 2: SOMOS FANTASMA (Defendiendo)
+            else:
+                # Solo nos mata un Pacman SI nosotros estamos asustados
+                if we_are_scared and enemy.is_pacman:
+                    is_dangerous = True
+                # IMPORTANTE: Si NO estamos asustados, el Pacman enemigo NO es peligroso.
+                # Es comida. Al no marcarlo como danger, el A* permitirá chocar con él.
+
             if not is_dangerous:
                 continue
             
             dist = agent.get_maze_distance(agent_pos, enemy_pos)
-            
-            # Track closest dangerous enemy
             if dist < closest_ghost_dist:
                 closest_ghost_dist = dist
                 closest_ghost_pos = enemy_pos
             
-            # Mark as dangerous if very close
-            if dist <= 2:
-                dangers.add(enemy_pos)
-            
-            # Mark nearby if moderately close
-            if dist <= 6:
-                ghost_nearby = True
+            if dist <= 2: dangers.add(enemy_pos)
+            if dist <= 6: ghost_nearby = True
         
-
         return dangers, ghost_nearby, closest_ghost_pos
