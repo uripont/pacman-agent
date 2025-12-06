@@ -33,10 +33,12 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.5.0, by Jorge and Oriol
+    """LaPulga v0.5.1, by Jorge and Oriol
+    
+    NEW FIX: Now correctly classifies all cells on attacking side into safe paths and cul-de-sacs.
+    To be used to never again commit mistakes entering dead-end corridors.
     
     NEW PHASE: Initial static layout analysis with detailed debug output (not used for now on strategy)
-    This initial version currently detects entry points and food clusters, and prints a detailed report.
     To be expanded and used during situation/strategy layers in upcoming versions.
     This takes advantage of the 15-second initialization time allowed, that we were previously ignoring.
     We expect this will allow us to better handle complex maps and remove "patches" we have been adding.
@@ -118,10 +120,21 @@ class LaPulga(CaptureAgent):
             food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
             print(f"  {fc} | Food: {food_str}")
         
+        # Corridor analysis results
+        print(f"\nCorridor Analysis:")
+        print(f"  Safe Paths (Green): {len(self.layout_info.corridor_cells)} cells")
+        print(f"  Cul-de-sacs (Red): {len(self.layout_info.cul_de_sac_cells)} cells")
+        print(f"\nCul-de-sac Clusters ({len(self.layout_info.cul_de_sac_clusters)}):")
+        for cul_de_sac in self.layout_info.cul_de_sac_clusters:
+            cells_str = ", ".join(str(c) for c in sorted(cul_de_sac.cells))
+            print(f"  {cul_de_sac} | Cells: {cells_str}")
+        
         # ASCII map visualization
         BLUE = "\033[44m"  # Blue background
+        GREEN = "\033[42m"  # Green background
+        RED = "\033[41m"    # Red background
         RESET = "\033[0m"
-        print(f"\nMap Visualization: {BLUE} {RESET} = Entry Point")
+        print(f"\nMap Visualization: {BLUE} {RESET} = Entry Point, {GREEN} {RESET} = Safe Path, {RED} {RESET} = Cul-de-sac")
         
         # Get all food positions
         entry_set = set(self.layout_info.boundary_cells)
@@ -140,10 +153,26 @@ class LaPulga(CaptureAgent):
                     row += "█"  # Wall
                 elif (x, y) in entry_set:
                     row += f"{BLUE} {RESET}"  # Entry point (blue)
+                elif (x, y) in self.layout_info.corridor_cells:
+                    # Safe path, show food with color or empty space
+                    if (x, y) in own_food:
+                        row += f"{GREEN}●{RESET}"  # Own food on safe path
+                    elif (x, y) in enemy_food:
+                        row += f"{GREEN}○{RESET}"  # Enemy food on safe path
+                    else:
+                        row += f"{GREEN} {RESET}"  # Empty safe path
+                elif (x, y) in self.layout_info.cul_de_sac_cells:
+                    # Cul-de-sac, show food with color or empty space
+                    if (x, y) in own_food:
+                        row += f"{RED}●{RESET}"  # Own food on cul-de-sac
+                    elif (x, y) in enemy_food:
+                        row += f"{RED}○{RESET}"  # Enemy food on cul-de-sac
+                    else:
+                        row += f"{RED} {RESET}"  # Empty cul-de-sac
                 elif (x, y) in own_food:
-                    row += "●"  # Own food
+                    row += "●"  # Own food (unclassified)
                 elif (x, y) in enemy_food:
-                    row += "○"  # Enemy food
+                    row += "○"  # Enemy food (unclassified)
                 else:
                     row += " "  # Floor
             # Add y-coordinate label
@@ -1054,7 +1083,11 @@ class LayoutInfo:
         self.enemy_clusters = []  # List of FoodCluster on enemy side
         self.cell_to_cluster = {}  # Dict: (x,y) to FoodCluster
         
-        # TODO: Corridor analysis to be implemented
+        # Corridor analysis
+        self.corridor_cells = set()  # Safe paths (has redundant routes home)
+        self.cul_de_sac_cells = set()  # Dead-end zones
+        self.cul_de_sac_clusters = []  # List of CulDeSac clusters
+        self.cell_to_safety_type = {}  # Dict: (x,y) to 'safe_path' or 'cul_de_sac'
 
 
 class LayoutAnalyzer:
@@ -1071,7 +1104,8 @@ class LayoutAnalyzer:
         # Phase 2: Analyze food clusters on both sides
         self._analyze_food_clusters(layout_info, game_state, agent, team_is_red)
         
-        # TODO: Analyze corridors and cul-de-sacs
+        # Phase 3: Analyze corridors and cul-de-sacs on attack side
+        self._analyze_corridors_and_culs_de_sac(layout_info, walls, team_is_red)
         
         return layout_info
     
@@ -1205,3 +1239,115 @@ class LayoutAnalyzer:
             if 0 <= nx < walls.width and 0 <= ny < walls.height and not walls[nx][ny]:
                 neighbors.append((nx, ny))
         return neighbors
+    
+    def _cluster_contiguous_cells(self, cells):
+        """Group a set of cells into contiguous clusters (4-connected)"""
+        if not cells:
+            return []
+        
+        visited = set()
+        clusters = []
+        
+        for cell in cells:
+            if cell in visited:
+                continue
+            
+            # BFS to find contiguous group
+            cluster = set()
+            queue = [cell]
+            visited.add(cell)
+            
+            while queue:
+                curr = queue.pop(0)
+                cluster.add(curr)
+                
+                # Find adjacent cells in the same set
+                for neighbor in [(curr[0]+1, curr[1]), (curr[0]-1, curr[1]), 
+                                (curr[0], curr[1]+1), (curr[0], curr[1]-1)]:
+                    if neighbor in cells and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            
+            clusters.append(cluster)
+        
+        return clusters
+    
+    def _analyze_corridors_and_culs_de_sac(self, layout_info, walls, team_is_red):
+        """
+        Classify passable cells on attack side into:
+        - Safe paths (green): cells with independent routes to boundary (not blocked by single chokepoint)
+        - Cul-de-sacs (red): cells that all route through a single chokepoint to escape
+        
+        Algorithm we used:
+        1. Identify dead-ends (cells with only 1 neighbor)
+        2. Iteratively expand: treat identified cul-de-sacs as walls (!), find new dead-ends behind them
+        3. Repeat until no more cul-de-sacs are found, and thus we have also the safe path
+        """
+        width = walls.width
+        height = walls.height
+        mid_x = width // 2
+        
+        # Determine which side is attack
+        if team_is_red:
+            attack_side_range = range(mid_x, width)
+            boundary_x = mid_x
+        else:
+            attack_side_range = range(0, mid_x)
+            boundary_x = mid_x - 1
+        
+        # Build the passable graph on attack side
+        passable_attack = set()
+        for x in attack_side_range:
+            for y in range(height):
+                if not walls[x][y]:
+                    passable_attack.add((x, y))
+        
+        # Add food cells to the graph
+        for cluster in layout_info.enemy_clusters:
+            passable_attack.update(cluster.initial_food)
+        
+        # Iteratively identify cul-de-sacs by treating previous cul-de-sacs as walls
+        cul_de_sac_cells = set()
+        max_iterations = len(passable_attack)  # Worst case: all cells are cul-de-sacs
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            available = passable_attack - cul_de_sac_cells
+            
+            if not available:
+                break
+            
+            new_dead_ends = set()
+            for cell in available:
+                # Count neighbors that are still available (not walls, not known cul-de-sacs)
+                available_neighbors = [n for n in self._get_neighbors(cell, walls) 
+                                      if n in available]
+                
+                if len(available_neighbors) == 1:
+                    new_dead_ends.add(cell)
+            
+            if not new_dead_ends:
+                break
+            
+            cul_de_sac_cells.update(new_dead_ends)
+        
+        # Safe paths are everything else
+        safe_cells = passable_attack - cul_de_sac_cells
+        layout_info.corridor_cells = safe_cells
+        layout_info.cul_de_sac_cells = cul_de_sac_cells
+        
+        # Cluster the cul-de-sac cells into contiguous zones
+        layout_info.cul_de_sac_clusters = self._cluster_contiguous_cells(cul_de_sac_cells)
+        # Convert to CulDeSac objects
+        cul_de_sac_objs = []
+        for cluster_id, cells in enumerate(layout_info.cul_de_sac_clusters):
+            cul_de_sac = CulDeSac(cluster_id, cells, None, 0)  # entry_cell and depth set to None/0 for now
+            cul_de_sac_objs.append(cul_de_sac)
+        layout_info.cul_de_sac_clusters = cul_de_sac_objs
+        
+        # Build cell-to-type mapping
+        for cell in layout_info.corridor_cells:
+            layout_info.cell_to_safety_type[cell] = 'safe_path'
+        for cell in layout_info.cul_de_sac_cells:
+            layout_info.cell_to_safety_type[cell] = 'cul_de_sac'
