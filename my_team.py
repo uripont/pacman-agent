@@ -1,3 +1,5 @@
+
+
 # my_team.py
 # ---------------
 # Licensing Information: Please do not distribute or publish solutions to this
@@ -10,6 +12,7 @@ import util as util
 
 from capture_agents import CaptureAgent
 from game import Directions
+from util import manhattan_distance
 
 #################
 # Team creation #
@@ -30,18 +33,13 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.8, by Jorge and Oriol
+    """LaPulga v0.5.0, by Jorge and Oriol
     
-    NEW STRATEGY: Pincer Defense (Hammer & Anvil)
-    Solves the "Conga Line" issue where two defenders chased the same invader inefficiently.
-    - Primary Defender (The Hammer): The agent closest to the enemy invader pursues directly to kill.
-    - Secondary Defender (The Anvil): The agent further away moves to the boundary/frontier to cut off the enemy's escape route.
-    
-    PREVIOUS CRITICAL FIXES (v1.0):
-    1. Inference Defense (Food Memory): BREAKS BLINDNESS in Jumbo maps. Tracks disappearing food to infer invisible enemy positions and moves to investigate.
-    2. Fearless Defense: Fixed a bug where defenders treated non-scared enemy Pacmen as "Dangerous Obstacles" in A*. Now treats them as FOOD targets (Fixes -56 score in fastCapture).
-    3. Anti-Greed Logic: If the path home is blocked while carrying food, switches target to the nearest capsule or evasive maneuvers instead of freezing.
-    4. Jumbo Range: Increased A* search depth to 300 to handle large maps.
+    NEW PHASE: Initial static layout analysis with detailed debug output (not used for now on strategy)
+    This initial version currently detects entry points and food clusters, and prints a detailed report.
+    To be expanded and used during situation/strategy layers in upcoming versions.
+    This takes advantage of the 15-second initialization time allowed, that we were previously ignoring.
+    We expect this will allow us to better handle complex maps and remove "patches" we have been adding.
 
     CORE ARCHITECTURE:
     1. Situation: Analyzes game state (visible/inferred threats, food counts, team positions).
@@ -52,8 +50,7 @@ class LaPulga(CaptureAgent):
     5. Fallback: Stuck detection with strategic sacrifice to break stalemates.
     """
     
-    # Set to True to see debug output about scared retreat behavior and stuck detection
-    DEBUG = True  # Enabled to debug stuck detection
+    DEBUG = True 
     
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
@@ -71,16 +68,102 @@ class LaPulga(CaptureAgent):
         self.strategy_selector = StrategySelector()
         self.goal_chooser = GoalChooser()
         self.path_finder = PathFinder()
+        
+        # Static layout analysis (computed once, shared across team)
+        self.layout_analyzer = LayoutAnalyzer()
+        self.layout_info = None  # Populated in register_initial_state
+
 
     def register_initial_state(self, game_state):
         self.start = game_state.get_agent_position(self.index)
         CaptureAgent.register_initial_state(self, game_state)
         
+        # Perform static layout analysis (only on first agent call to avoid duplication)
+        # We use a class variable to share across both agents
+        # This runs within the 15-second startup allowance
+        if not hasattr(LaPulga, '_layout_info_shared'):
+            self.layout_info = self.layout_analyzer.analyze(game_state, self, game_state.is_on_red_team(self.index))
+            LaPulga._layout_info_shared = self.layout_info  # Store in class for teammate access
+            if self.DEBUG:
+                self._print_layout_analysis(game_state)
+        else:
+            # Teammate already computed it, reuse
+            self.layout_info = LaPulga._layout_info_shared
+        
         # NUEVO: Inicializar memoria de comida defensiva
         self.last_defending_food = self.get_food_you_are_defending(game_state).as_list()
         self.memory_invader_pos = None # Última posición conocida/inferida del invasor
         self.memory_timer = 0          # Cuánto tiempo recordar esa posición
+    
         
+    def _print_layout_analysis(self, game_state):
+        walls = game_state.get_walls()
+        width = walls.width
+        height = walls.height
+        
+        print(f"LAYOUT ANALYSIS (Agent {self.index}) - {game_state.is_on_red_team(self.index) and 'RED' or 'BLUE'} TEAM")
+        
+        print(f"\nEntry groups ({len(self.layout_info.entry_groups)}):")
+        for eg in self.layout_info.entry_groups:
+            cells_str = ", ".join(str(c) for c in eg.cells)
+            print(f"  Group {eg.id}: {eg} | Cells: {cells_str}")
+        
+        print(f"\nOwn food clusters ({len(self.layout_info.own_clusters)}):")
+        for fc in self.layout_info.own_clusters:
+            food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
+            print(f"  {fc} | Food: {food_str}")
+        
+        print(f"\nEnemy food clusters ({len(self.layout_info.enemy_clusters)}):")
+        for fc in self.layout_info.enemy_clusters:
+            food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
+            print(f"  {fc} | Food: {food_str}")
+        
+        # ASCII map visualization
+        BLUE = "\033[44m"  # Blue background
+        RESET = "\033[0m"
+        print(f"\nMap Visualization: {BLUE} {RESET} = Entry Point")
+        
+        # Get all food positions
+        entry_set = set(self.layout_info.boundary_cells)
+        own_food = set()
+        enemy_food = set()
+        for cluster in self.layout_info.own_clusters:
+            own_food.update(cluster.initial_food)
+        for cluster in self.layout_info.enemy_clusters:
+            enemy_food.update(cluster.initial_food)
+        
+        # Print map
+        for y in range(height - 1, -1, -1):  # Print from top to bottom
+            row = ""
+            for x in range(width):
+                if walls[x][y]:
+                    row += "█"  # Wall
+                elif (x, y) in entry_set:
+                    row += f"{BLUE} {RESET}"  # Entry point (blue)
+                elif (x, y) in own_food:
+                    row += "●"  # Own food
+                elif (x, y) in enemy_food:
+                    row += "○"  # Enemy food
+                else:
+                    row += " "  # Floor
+            # Add y-coordinate label
+            print(f"  {y:2d} | {row}")
+        
+        # X-axis labels (second digit - tens place)
+        x_labels_tens = "     | "
+        for x in range(width):
+            digit = (x // 10) % 10
+            x_labels_tens += str(digit) if digit != 0 else " "
+        print(x_labels_tens)
+        
+        # X-axis labels (first digit)
+        x_labels = "     | "
+        for x in range(width):
+            x_labels += str(x % 10)
+        print(x_labels)
+        
+        print(f"{'='*80}\n")
+    
     def _should_sacrifice(self, game_state):
         """Determine if we should sacrifice ourselves when stuck.
         
@@ -520,7 +603,9 @@ class GoalChooser:
             # Filter food to only safe options
             safe_food = [f for f in food_list 
                         if self._is_pos_safe(game_state, agent, f, 
-                                              situation.agent_pos, ghost_pos)]
+                                              situation.agent_pos, ghost_pos)
+                        and not self._is_in_corridor_trap(game_state, agent, f,
+                                                          situation.agent_pos, ghost_pos)]
             
             if safe_food:
                 return min(safe_food, key=lambda f: agent.get_maze_distance(situation.agent_pos, f))
@@ -552,6 +637,73 @@ class GoalChooser:
         
         # Safe if we can reach the target and turn around before the ghost blocks us
         return dist_ghost_to_target > dist_agent_to_target + 2
+    
+    def _is_in_corridor_trap(self, game_state, agent, food_pos, agent_pos, ghost_pos):
+        """
+        Detect if pursuing food_pos would trap us with no safe exit.
+        
+        Core principle: Never enter a zone where the only exit passes through ghost_pos.
+        This prevents getting locked in corridors, dead-ends, or islands.
+        
+        Returns True if the food should be avoided (it's a trap).
+        """
+        if ghost_pos is None:
+            return False
+        
+        walls = game_state.get_walls()
+        
+        # Count how many exits lead away from the ghost
+        # We need to check if there's a path to food that doesn't require passing through ghost
+        safe_exits = self._count_safe_exits(game_state, agent, food_pos, ghost_pos)
+        
+        # If there are NO alternative routes (all paths pass through/near ghost), it's a trap
+        if safe_exits == 0:
+            return True
+        
+        return False
+    
+    def _count_safe_exits(self, game_state, agent, target_pos, ghost_pos):
+        """
+        Count how many fundamentally different escape routes exist from target_pos
+        that don't require the ghost blocking them.
+        
+        Uses BFS to find exits from target that lead to open areas, excluding
+        paths that would be trapped if ghost moves there.
+        """
+        walls = game_state.get_walls()
+        ghost_dist = agent.get_maze_distance(target_pos, ghost_pos)
+        
+        # BFS from target position to find open areas
+        visited = set()
+        queue = [(target_pos, 0)]  # (position, distance_from_target)
+        safe_exits = 0
+        MAX_SEARCH = 15  # How far to search for exits
+        
+        while queue:
+            curr_pos, dist = queue.pop(0)
+            if curr_pos in visited or dist > MAX_SEARCH:
+                continue
+            visited.add(curr_pos)
+            
+            # Count this as a safe exit if:
+            # 1. It's far enough from target that ghost can't easily block both
+            # 2. It's not too close to where ghost currently is
+            if dist >= 5:  # Need distance to be meaningful
+                curr_ghost_dist = agent.get_maze_distance(curr_pos, ghost_pos)
+                # If this position is far from ghost, it's a safe exit
+                if curr_ghost_dist > 8:
+                    safe_exits += 1
+                    if safe_exits >= 2:  # Found enough exits
+                        return safe_exits
+            
+            # Explore neighbors
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = curr_pos[0] + dx, curr_pos[1] + dy
+                if (0 <= nx < walls.width and 0 <= ny < walls.height and 
+                    not walls[nx][ny] and (nx, ny) not in visited):
+                    queue.append(((nx, ny), dist + 1))
+        
+        return safe_exits
 
     def _goal_defend(self, game_state, agent, situation):
         # Objetivo prioritario: Enemigo (Visible > Inferido)
@@ -732,7 +884,9 @@ class PathFinder:
         
         # Get threat analysis to avoid ghosts
         dangers, ghost_nearby, closest_ghost_pos = self._get_danger_info(game_state, agent)
-        corridor_dangers = PathFinder.get_dangerous_corridors(game_state) if ghost_nearby else set()
+        # ALWAYS analyze corridors to avoid walking into traps proactively
+        # Don't wait until ghost is nearby - that's too late for long corridors like AlleyCapture
+        corridor_dangers = PathFinder.get_dangerous_corridors(game_state)
         
         while not pq.is_empty():
             curr_pos, path = pq.pop()
@@ -763,11 +917,13 @@ class PathFinder:
                 h = agent.get_maze_distance(next_pos, goal) 
                 penalty = 0
                 
-                # Penalize corridor entry if ghost is nearby
-                if ghost_nearby and next_pos in corridor_dangers:
-                    ghost_dist = agent.get_maze_distance(closest_ghost_pos, next_pos)
-                    if ghost_dist <= g + 3:  # Ghost could trap us
-                        penalty = 100
+                # Penalize dead-end corridor entry unless it's our goal
+                # This prevents entering S-shaped corridors proactively
+                if next_pos in corridor_dangers and next_pos != goal:
+                    # Only penalize if we're committing deeper into the corridor
+                    # (i.e., this move increases our commitment to the dead-end)
+                    if curr_pos not in corridor_dangers:  # Entering a corridor
+                        penalty = 50  # Moderate penalty to discourage but allow if best path
                 
                 f = g + h + penalty
                 pq.push((next_pos, path + [action]), f)
@@ -818,3 +974,234 @@ class PathFinder:
             if dist <= 6: ghost_nearby = True
         
         return dangers, ghost_nearby, closest_ghost_pos
+
+
+###########################
+# Layout Static Analysis  #
+###########################
+
+class EntryGroup:
+    """Represents a contiguous group of entry points (a 'line' of attack)"""
+    def __init__(self, group_id, cells):
+        self.id = group_id
+        self.cells = cells  # List of (x,y) boundary cells
+        self.representative = cells[len(cells) // 2]  # Middle cell
+        y_coords = [c[1] for c in cells]
+        self.y_range = (min(y_coords), max(y_coords))
+    
+    def __repr__(self):
+        return f"EntryGroup(id={self.id}, cells={len(self.cells)}, rep={self.representative})"
+
+
+class FoodCluster:
+    """Represents a spatial cluster of food pellets"""
+    def __init__(self, cluster_id, initial_food_set, side):
+        self.id = cluster_id
+        self.initial_food = initial_food_set  # Set of (x,y)
+        self.side = side    # 'own' or 'enemy'
+        self.nearest_entry_group = None  # Will be set after analysis
+    
+    def count_remaining(self, game_state, agent):
+        """Count how many food pellets are still present (hasn't been eaten)"""
+        if self.side == 'own':
+            current_food = agent.get_food_you_are_defending(game_state).as_list()
+        else:
+            current_food = agent.get_food(game_state).as_list()
+        return len(self.initial_food & set(current_food))
+    
+    def __repr__(self):
+        return f"FoodCluster(id={self.id}, size={len(self.initial_food)})"
+
+
+class CulDeSac: # TODO: should replace all corridor analysis we were doing before
+    """Represents a dead-end zone with its entry point"""
+    def __init__(self, sac_id, cells, entry_cell, depth):
+        self.id = sac_id
+        self.cells = cells  # Set of (x,y) in this cul-de-sac
+        self.entry_cell = entry_cell  # The chokepoint (x,y)
+        self.depth = depth  # Max distance from entry to deepest cell
+    
+    def __repr__(self):
+        return f"CulDeSac(id={self.id}, size={len(self.cells)}, entry={self.entry_cell}, depth={self.depth})"
+
+
+class CellInfo:
+    """Per-cell metadata about escape routes and safety"""
+    def __init__(self, pos):
+        self.pos = pos
+        self.is_cul_de_sac = False
+        self.cul_de_sac_id = None
+        self.distance_to_home = float('inf')
+        self.nearest_home_entry = None
+        self.escape_cells = set()  # Cells that lead toward home
+        self.num_exits = 0  # How many distinct escape directions
+        self.is_chokepoint = False  # Is this the entry to a cul-de-sac?
+    
+    def __repr__(self):
+        return f"CellInfo({self.pos}, cul={self.is_cul_de_sac}, exits={self.num_exits})"
+
+
+class LayoutInfo:
+    """Container for all static layout analysis"""
+    def __init__(self):
+        # Home entry analysis
+        self.boundary_cells = []  # All passable cells on the boundary
+        self.entry_groups = []  # List of EntryGroup
+        self.cell_to_entry_group = {}  # Dict: (x,y) to EntryGroup
+        
+        # Food cluster analysis
+        self.own_clusters = []  # List of FoodCluster on our side
+        self.enemy_clusters = []  # List of FoodCluster on enemy side
+        self.cell_to_cluster = {}  # Dict: (x,y) to FoodCluster
+        
+        # TODO: Corridor analysis to be implemented
+
+
+class LayoutAnalyzer:
+    """Performs static analysis of the game layout (one-time at game start)"""
+    
+    def analyze(self, game_state, agent, team_is_red):
+        """Main entry point: perform all layout analyses"""
+        layout_info = LayoutInfo()
+        walls = game_state.get_walls()
+        
+        # Phase 1: Analyze home entry points and group them
+        self._analyze_home_entries(layout_info, walls, team_is_red)
+        
+        # Phase 2: Analyze food clusters on both sides
+        self._analyze_food_clusters(layout_info, game_state, agent, team_is_red)
+        
+        # TODO: Analyze corridors and cul-de-sacs
+        
+        return layout_info
+    
+    def _analyze_home_entries(self, layout_info, walls, team_is_red):
+        """
+        Identify all entry points to home base and group contiguous ones.
+        Entry groups are "lines" of adjacent entry points (important for interception).
+        """
+        width = walls.width
+        height = walls.height
+        
+        # Determine boundary x coordinate
+        mid_x = width // 2
+        boundary_x = mid_x - 1 if team_is_red else mid_x
+        
+        # Find all passable boundary cells
+        boundary_cells = []
+        for y in range(height):
+            if not walls[boundary_x][y]:
+                boundary_cells.append((boundary_x, y))
+        
+        layout_info.boundary_cells = boundary_cells
+        
+        # Group contiguous boundary cells into entry groups
+        visited = set()
+        entry_group_id = 0
+        
+        for cell in boundary_cells:
+            if cell in visited:
+                continue
+            
+            # BFS to find all contiguous cells
+            group_cells = []
+            queue = [cell]
+            visited.add(cell)
+            
+            while queue:
+                curr = queue.pop(0)
+                group_cells.append(curr)
+                
+                # Look for adjacent boundary cells (vertical neighbors only, since we're on a line)
+                for neighbor in [(curr[0], curr[1] - 1), (curr[0], curr[1] + 1)]:
+                    if neighbor in boundary_cells and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            
+            # Create entry group
+            entry_group = EntryGroup(entry_group_id, group_cells)
+            layout_info.entry_groups.append(entry_group)
+            entry_group_id += 1
+            
+            # Map each cell to its group
+            for cell in group_cells:
+                layout_info.cell_to_entry_group[cell] = entry_group
+    
+    def _analyze_food_clusters(self, layout_info, game_state, agent, team_is_red):
+        """
+        Identify food clusters on both sides of the map.
+        Clustering uses contiguous food: adjacent food cells are in same cluster.
+        """
+        walls = game_state.get_walls()
+        width = walls.width
+        height = walls.height
+        mid_x = width // 2
+        
+        # Get food we're defending (our own food)
+        own_side_food = set(agent.get_food_you_are_defending(game_state).as_list())
+        
+        # Get food we're attacking (enemy food)
+        all_food = set(agent.get_food(game_state).as_list())
+        enemy_side_food = all_food
+        
+        # Cluster each side
+        layout_info.own_clusters = self._cluster_contiguous_food(own_side_food, walls)
+        layout_info.enemy_clusters = self._cluster_contiguous_food(enemy_side_food, walls)
+        
+        # Mark clusters with their side
+        for cluster in layout_info.own_clusters:
+            cluster.side = 'own'
+        for cluster in layout_info.enemy_clusters:
+            cluster.side = 'enemy'
+        
+        # Map food positions to clusters
+        for cluster in layout_info.own_clusters + layout_info.enemy_clusters:
+            for food_pos in cluster.initial_food:
+                layout_info.cell_to_cluster[food_pos] = cluster
+    
+    def _cluster_contiguous_food(self, food_set, walls):
+        """
+        Cluster food positions using contiguous adjacency.
+        Two food are in same cluster if they are directly adjacent (4-connected).
+        """
+        if not food_set:
+            return []
+        
+        visited = set()
+        clusters = []
+        cluster_id = 0
+        
+        for food in food_set:
+            if food in visited:
+                continue
+            
+            # BFS to find contiguous group
+            cluster_cells = set()
+            queue = [food]
+            visited.add(food)
+            
+            while queue:
+                curr = queue.pop(0)
+                cluster_cells.add(curr)
+                
+                # Find adjacent food cells
+                for neighbor in self._get_neighbors(curr, walls):
+                    if neighbor in food_set and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            
+            cluster = FoodCluster(cluster_id, cluster_cells, 'unknown')
+            clusters.append(cluster)
+            cluster_id += 1
+        
+        return clusters
+    
+    def _get_neighbors(self, pos, walls):
+        """Get all valid non-wall neighbors of a position"""
+        x, y = pos
+        neighbors = []
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < walls.width and 0 <= ny < walls.height and not walls[nx][ny]:
+                neighbors.append((nx, ny))
+        return neighbors
