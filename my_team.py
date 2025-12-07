@@ -1,3 +1,5 @@
+
+
 # my_team.py
 # ---------------
 # Licensing Information: Please do not distribute or publish solutions to this
@@ -31,9 +33,10 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.5.2, by Jorge and Oriol
+    """LaPulga v0.5.3, by Jorge and Oriol
     
-    NEW FIX: Now we are analyzing the powercapsule positions and the bes action possible idealyto do with that capsule.
+    NEW FIX: Now correctly classifies all cells on attacking side into safe paths and cul-de-sacs.
+    To be used to never again commit mistakes entering dead-end corridors.
     
     NEW PHASE: Initial static layout analysis with detailed debug output (not used for now on strategy)
     To be expanded and used during situation/strategy layers in upcoming versions.
@@ -137,7 +140,22 @@ class LaPulga(CaptureAgent):
         print(f"\nEnemy food clusters ({len(self.layout_info.enemy_clusters)}):")
         for fc in self.layout_info.enemy_clusters:
             food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
-            print(f"  {fc} | Food: {food_str}")
+            # Mostramos el número de entradas y algunas de ellas
+            entry_preview = list(fc.entry_cells)[:3] if fc.entry_cells else []
+            entry_str = f"{entry_preview}..." if len(fc.entry_cells) > 3 else str(list(fc.entry_cells))
+            print(f"  {fc} | Entries ({len(fc.entry_cells)}): {entry_str} | Food: {food_str}")
+
+        # NUEVO: Imprimir distancias entre clusters
+        print(f"\nInter-Cluster Distances (Enemy Side Connectivity):")
+        if self.layout_info.cluster_distances:
+            # Ordenar por ID para que sea legible
+            keys = sorted(self.layout_info.cluster_distances.keys())
+            for (id1, id2) in keys:
+                if id1 < id2:  # Solo imprimir una vez cada par (evitar duplicados)
+                    dist = self.layout_info.cluster_distances[(id1, id2)]
+                    print(f"  Cluster {id1} <-> Cluster {id2}: {dist} steps")
+        else:
+            print("  No multi-cluster connections calculated.")
         
         # Corridor analysis results
         print(f"\nCorridor Analysis:")
@@ -1057,10 +1075,10 @@ class FoodCluster:
         self.id = cluster_id
         self.initial_food = initial_food_set  # Set of (x,y)
         self.side = side    # 'own' or 'enemy'
-        self.nearest_entry_group = None  # Will be set after analysis
+        self.entry_cells = set()  # NUEVO: Celdas vacías desde las que se accede al cluster
     
     def count_remaining(self, game_state, agent):
-        """Count how many food pellets are still present (hasn't been eaten)"""
+        """Count how many food pellets are still present"""
         if self.side == 'own':
             current_food = agent.get_food_you_are_defending(game_state).as_list()
         else:
@@ -1068,7 +1086,7 @@ class FoodCluster:
         return len(self.initial_food & set(current_food))
     
     def __repr__(self):
-        return f"FoodCluster(id={self.id}, size={len(self.initial_food)})"
+        return f"FoodCluster(id={self.id}, size={len(self.initial_food)}, entries={len(self.entry_cells)})"
 
 
 class CulDeSac: # TODO: should replace all corridor analysis we were doing before
@@ -1126,6 +1144,10 @@ class LayoutInfo:
         self.enemy_clusters = []  # List of FoodCluster on enemy side
         self.cell_to_cluster = {}  # Dict: (x,y) to FoodCluster
         
+        # NUEVO: Matriz de distancias entre clusters
+        # Keys: tupla (id_cluster_A, id_cluster_B) -> Value: int (distancia)
+        self.cluster_distances = {}
+        
         # Capsule analysis
         self.own_capsules = []    # List of (x,y)
         self.enemy_capsules = []  # List of (x,y)
@@ -1148,14 +1170,18 @@ class LayoutAnalyzer:
         # Phase 1: Analyze home entry points and group them
         self._analyze_home_entries(layout_info, walls, team_is_red)
         
-        # Phase 2: Analyze food clusters on both sides
+        # Phase 2: Analyze food clusters AND their entry points (ACTUALIZADO)
         self._analyze_food_clusters(layout_info, game_state, agent, team_is_red)
         
-        # Phase 3: Analyze power capsules and their potential (ACTUALIZADO)
-        self._analyze_capsules(layout_info, game_state, agent)
-        self._analyze_capsule_potential(layout_info, walls, agent)  # NUEVA LLAMADA
+        # Phase 3: Pre-calculate distances between enemy clusters (NUEVO)
+        # Solo calculamos distancias entre clusters enemigos porque es donde nos moveremos atacando
+        self._analyze_cluster_distances(layout_info, walls)
 
-        # Phase 4: Analyze corridors and cul-de-sacs on attack side
+        # Phase 4: Analyze power capsules and their potential
+        self._analyze_capsules(layout_info, game_state, agent)
+        self._analyze_capsule_potential(layout_info, walls, agent)
+
+        # Phase 5: Analyze corridors and cul-de-sacs on attack side
         self._analyze_corridors_and_culs_de_sac(layout_info, walls, team_is_red)
         
         return layout_info
@@ -1237,6 +1263,71 @@ class LayoutAnalyzer:
             
             # Store analysis
             layout_info.capsule_analysis[cap_pos] = analysis
+
+    def _analyze_cluster_distances(self, layout_info, walls):
+        """
+        NUEVO: Pre-calculate distances between all pairs of Enemy Clusters.
+        Stores the Maze Distance between the ENTRY CELLS of Cluster A and Cluster B.
+        """
+        clusters = layout_info.enemy_clusters
+        n = len(clusters)
+        
+        # Inicializar diccionario
+        layout_info.cluster_distances = {}
+        
+        # Comparar cada par de clusters (sin repetir)
+        for i in range(n):
+            for j in range(i + 1, n):
+                c1 = clusters[i]
+                c2 = clusters[j]
+                
+                # Calcular la distancia más corta entre el CONJUNTO de entradas de c1
+                # y el CONJUNTO de entradas de c2.
+                dist = self._bfs_distance_between_sets(c1.entry_cells, c2.entry_cells, walls)
+                
+                # Guardar en ambas direcciones
+                layout_info.cluster_distances[(c1.id, c2.id)] = dist
+                layout_info.cluster_distances[(c2.id, c1.id)] = dist
+
+    def _bfs_distance_between_sets(self, start_set, goal_set, walls):
+        """
+        Calculates shortest path from ANY cell in start_set to ANY cell in goal_set.
+        Returns distance as integer.
+        """
+        if not start_set or not goal_set:
+            return float('inf')
+            
+        # Optimization: Check if sets overlap (distance 0)
+        if not start_set.isdisjoint(goal_set):
+            return 0
+            
+        # BFS Init
+        queue = []
+        visited = set()
+        
+        # Añadir todas las celdas de inicio con distancia 0
+        for cell in start_set:
+            queue.append((cell, 0))
+            visited.add(cell)
+            
+        while queue:
+            curr_pos, dist = queue.pop(0)
+            
+            # Si llegamos a CUALQUIER celda del objetivo, hemos terminado
+            if curr_pos in goal_set:
+                return dist
+                
+            # Expandir
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = curr_pos[0] + dx, curr_pos[1] + dy
+                
+                if (0 <= nx < walls.width and 0 <= ny < walls.height and 
+                    not walls[nx][ny] and (nx, ny) not in visited):
+                    
+                    visited.add((nx, ny))
+                    queue.append(((nx, ny), dist + 1))
+        
+        return float('inf')  # No conectadas
     
     def _analyze_home_entries(self, layout_info, walls, team_is_red):
         """
@@ -1292,35 +1383,44 @@ class LayoutAnalyzer:
     
     def _analyze_food_clusters(self, layout_info, game_state, agent, team_is_red):
         """
-        Identify food clusters on both sides of the map.
-        Clustering uses contiguous food: adjacent food cells are in same cluster.
+        Identifies food clusters and calculates their ENTRY CELLS.
+        An entry cell is a non-wall, non-cluster cell adjacent to any food in the cluster.
         """
         walls = game_state.get_walls()
-        width = walls.width
-        height = walls.height
-        mid_x = width // 2
-        
-        # Get food we're defending (our own food)
         own_side_food = set(agent.get_food_you_are_defending(game_state).as_list())
-        
-        # Get food we're attacking (enemy food)
         all_food = set(agent.get_food(game_state).as_list())
         enemy_side_food = all_food
         
-        # Cluster each side
         layout_info.own_clusters = self._cluster_contiguous_food(own_side_food, walls)
         layout_info.enemy_clusters = self._cluster_contiguous_food(enemy_side_food, walls)
         
-        # Mark clusters with their side
+        # Assign sides
         for cluster in layout_info.own_clusters:
             cluster.side = 'own'
         for cluster in layout_info.enemy_clusters:
             cluster.side = 'enemy'
         
-        # Map food positions to clusters
+        # Global map mapping
         for cluster in layout_info.own_clusters + layout_info.enemy_clusters:
             for food_pos in cluster.initial_food:
                 layout_info.cell_to_cluster[food_pos] = cluster
+
+        # NUEVO: Calcular Entry Cells para cada cluster
+        # Analizamos tanto los nuestros (para defender entradas) como los enemigos (para atacar)
+        all_clusters = layout_info.own_clusters + layout_info.enemy_clusters
+        
+        for cluster in all_clusters:
+            entry_cells = set()
+            for food_pos in cluster.initial_food:
+                # Mirar vecinos
+                neighbors = self._get_neighbors(food_pos, walls)
+                for n in neighbors:
+                    # Si el vecino NO es parte de este cluster (es espacio vacío o comida de otro grupo)
+                    # lo consideramos una entrada.
+                    if n not in cluster.initial_food:
+                        entry_cells.add(n)
+            
+            cluster.entry_cells = entry_cells
     
     def _cluster_contiguous_food(self, food_set, walls):
         """
