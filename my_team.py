@@ -33,15 +33,14 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.5.3, by Jorge and Oriol
+    """LaPulga v0.6.0, by Jorge and Oriol
     
-    NEW FIX: Now correctly classifies all cells on attacking side into safe paths and cul-de-sacs.
-    To be used to never again commit mistakes entering dead-end corridors.
-    
-    NEW PHASE: Initial static layout analysis with detailed debug output (not used for now on strategy)
-    To be expanded and used during situation/strategy layers in upcoming versions.
-    This takes advantage of the 15-second initialization time allowed, that we were previously ignoring.
-    We expect this will allow us to better handle complex maps and remove "patches" we have been adding.
+    NEW FEATURE: Shared layout information. The static layout is starting to become our main source of
+    strategic knowledge, and we now have made it so that is is SHARED between the two instances of the
+    agent! This still does not affect the current strategy, but can be a game changer thanks to allowing
+    communication of static knowledge and explicit (non-emergent from heuristics) coordination logic.
+    To currently demonstrate it, the layout visualizer now shows both agents' positions on the map, each
+    currently updating only their own.
 
     CORE ARCHITECTURE:
     1. Situation: Analyzes game state (visible/inferred threats, food counts, team positions).
@@ -50,8 +49,6 @@ class LaPulga(CaptureAgent):
     3. Goal: Chooses specific target coordinates based on role (Hammer vs Anvil).
     4. Pathfinding: A* with dynamic danger avoidance (avoids dead-ends if ghosts are near).
     5. Fallback: Stuck detection with strategic sacrifice to break stalemates.
-    209/125/196 (39.43%) para 10 games con HARDs, antes 37%
-    BENCHMARK:| 3068/4620 (66.41%)
     """
     
     DEBUG = True 
@@ -100,79 +97,81 @@ class LaPulga(CaptureAgent):
         self.memory_timer = 0          # Cuánto tiempo recordar esa posición
     
         
-    def _print_layout_analysis(self, game_state):
+    def _print_layout_analysis(self, game_state, show_details=True):
         walls = game_state.get_walls()
         width = walls.width
         height = walls.height
         
-        print(f"LAYOUT ANALYSIS (Agent {self.index}) - {game_state.is_on_red_team(self.index) and 'RED' or 'BLUE'} TEAM")
-        
-        print(f"\nEntry groups ({len(self.layout_info.entry_groups)}):")
-        for eg in self.layout_info.entry_groups:
-            cells_str = ", ".join(str(c) for c in eg.cells)
-            print(f"  Group {eg.id}: {eg} | Cells: {cells_str}")
-        
-        # NUEVO: Análisis estratégico de cápsulas
-        print(f"\nCapsules Analysis (Opportunities):")
-        print(f"  Own Capsules (Defending): {self.layout_info.own_capsules}")
-        
-        if self.layout_info.enemy_capsules:
-            print(f"  Enemy Capsules Strategy:")
-            # Ordenar cápsulas por valor estratégico descendente
-            sorted_capsules = sorted(self.layout_info.enemy_capsules, 
-                                   key=lambda c: self.layout_info.capsule_analysis[c].strategic_value, 
-                                   reverse=True)
-            
-            for cap_pos in sorted_capsules:
-                analysis = self.layout_info.capsule_analysis[cap_pos]
-                cluster_info = f"Cluster {analysis.nearest_cluster.id}" if analysis.nearest_cluster else "None"
-                print(f"    @ {cap_pos}: Score {analysis.strategic_value:.1f} | "
-                      f"Local Food: {analysis.local_food_count} | "
-                      f"Next Target -> {cluster_info} (dist: {analysis.dist_to_cluster})")
-        else:
-            print(f"  No Enemy Capsules detected.")
-
-        print(f"\nOwn food clusters ({len(self.layout_info.own_clusters)}):")
-        for fc in self.layout_info.own_clusters:
-            food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
-            print(f"  {fc} | Food: {food_str}")
-        
-        print(f"\nEnemy food clusters ({len(self.layout_info.enemy_clusters)}):")
-        for fc in self.layout_info.enemy_clusters:
-            food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
-            # Mostramos el número de entradas y algunas de ellas
-            entry_preview = list(fc.entry_cells)[:3] if fc.entry_cells else []
-            entry_str = f"{entry_preview}..." if len(fc.entry_cells) > 3 else str(list(fc.entry_cells))
-            print(f"  {fc} | Entries ({len(fc.entry_cells)}): {entry_str} | Food: {food_str}")
-
-        # NUEVO: Imprimir distancias entre clusters
-        print(f"\nInter-Cluster Distances (Enemy Side Connectivity):")
-        if self.layout_info.cluster_distances:
-            # Ordenar por ID para que sea legible
-            keys = sorted(self.layout_info.cluster_distances.keys())
-            for (id1, id2) in keys:
-                if id1 < id2:  # Solo imprimir una vez cada par (evitar duplicados)
-                    dist = self.layout_info.cluster_distances[(id1, id2)]
-                    print(f"  Cluster {id1} <-> Cluster {id2}: {dist} steps")
-        else:
-            print("  No multi-cluster connections calculated.")
-        
-        # Corridor analysis results
-        print(f"\nCorridor Analysis:")
-        print(f"  Safe Paths (Green): {len(self.layout_info.corridor_cells)} cells")
-        print(f"  Cul-de-sacs (Red): {len(self.layout_info.cul_de_sac_cells)} cells")
-        print(f"\nCul-de-sac Clusters ({len(self.layout_info.cul_de_sac_clusters)}):")
-        for cul_de_sac in self.layout_info.cul_de_sac_clusters:
-            cells_str = ", ".join(str(c) for c in sorted(cul_de_sac.cells))
-            print(f"  {cul_de_sac} | Cells: {cells_str}")
-        
-        # ASCII map visualization
+        # ASCII map visualization - define colors early (needed for both paths)
         BLUE = "\033[44m"   # Blue background
         GREEN = "\033[42m"  # Green background
         RED = "\033[41m"    # Red background
         YELLOW = "\033[43m" # Yellow background (NEW for Capsules)
         RESET = "\033[0m"
-        print(f"\nMap Visualization: {BLUE} {RESET} = Entry, {GREEN} {RESET} = Safe, {RED} {RESET} = Trap, {YELLOW}o{RESET} = Capsule")
+        
+        if show_details:
+            print(f"LAYOUT ANALYSIS (Agent {self.index}) - {game_state.is_on_red_team(self.index) and 'RED' or 'BLUE'} TEAM")
+            
+            print(f"\nEntry groups ({len(self.layout_info.entry_groups)}):")
+            for eg in self.layout_info.entry_groups:
+                cells_str = ", ".join(str(c) for c in eg.cells)
+                print(f"  Group {eg.id}: {eg} | Cells: {cells_str}")
+            
+            # NUEVO: Análisis estratégico de cápsulas
+            print(f"\nCapsules Analysis (Opportunities):")
+            print(f"  Own Capsules (Defending): {self.layout_info.own_capsules}")
+            
+            if self.layout_info.enemy_capsules:
+                print(f"  Enemy Capsules Strategy:")
+                # Ordenar cápsulas por valor estratégico descendente
+                sorted_capsules = sorted(self.layout_info.enemy_capsules, 
+                                       key=lambda c: self.layout_info.capsule_analysis[c].strategic_value, 
+                                       reverse=True)
+                
+                for cap_pos in sorted_capsules:
+                    analysis = self.layout_info.capsule_analysis[cap_pos]
+                    cluster_info = f"Cluster {analysis.nearest_cluster.id}" if analysis.nearest_cluster else "None"
+                    print(f"    @ {cap_pos}: Score {analysis.strategic_value:.1f} | "
+                          f"Local Food: {analysis.local_food_count} | "
+                          f"Next Target -> {cluster_info} (dist: {analysis.dist_to_cluster})")
+            else:
+                print(f"  No Enemy Capsules detected.")
+
+            print(f"\nOwn food clusters ({len(self.layout_info.own_clusters)}):")
+            for fc in self.layout_info.own_clusters:
+                food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
+                print(f"  {fc} | Food: {food_str}")
+            
+            print(f"\nEnemy food clusters ({len(self.layout_info.enemy_clusters)}):")
+            for fc in self.layout_info.enemy_clusters:
+                food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
+                # Mostramos el número de entradas y algunas de ellas
+                entry_preview = list(fc.entry_cells)[:3] if fc.entry_cells else []
+                entry_str = f"{entry_preview}..." if len(fc.entry_cells) > 3 else str(list(fc.entry_cells))
+                print(f"  {fc} | Entries ({len(fc.entry_cells)}): {entry_str} | Food: {food_str}")
+
+            # NUEVO: Imprimir distancias entre clusters
+            print(f"\nInter-Cluster Distances (Enemy Side Connectivity):")
+            if self.layout_info.cluster_distances:
+                # Ordenar por ID para que sea legible
+                keys = sorted(self.layout_info.cluster_distances.keys())
+                for (id1, id2) in keys:
+                    if id1 < id2:  # Solo imprimir una vez cada par (evitar duplicados)
+                        dist = self.layout_info.cluster_distances[(id1, id2)]
+                        print(f"  Cluster {id1} <-> Cluster {id2}: {dist} steps")
+            else:
+                print("  No multi-cluster connections calculated.")
+            
+            # Corridor analysis results
+            print(f"\nCorridor Analysis:")
+            print(f"  Safe Paths (Green): {len(self.layout_info.corridor_cells)} cells")
+            print(f"  Cul-de-sacs (Red): {len(self.layout_info.cul_de_sac_cells)} cells")
+            print(f"\nCul-de-sac Clusters ({len(self.layout_info.cul_de_sac_clusters)}):")
+            for cul_de_sac in self.layout_info.cul_de_sac_clusters:
+                cells_str = ", ".join(str(c) for c in sorted(cul_de_sac.cells))
+                print(f"  {cul_de_sac} | Cells: {cells_str}")
+            
+            print(f"\nMap Visualization: {BLUE} {RESET} = Entry, {GREEN} {RESET} = Safe, {RED} {RESET} = Trap, {YELLOW}o{RESET} = Capsule")
         
         # Get all food positions
         entry_set = set(self.layout_info.boundary_cells)
@@ -193,10 +192,17 @@ class LaPulga(CaptureAgent):
             for x in range(width):
                 if walls[x][y]:
                     row += "█"  # Wall
+                # Check for agent positions first (highest priority - show agent numbers)
+                elif (x, y) in self.layout_info.agent_positions.values():
+                    # Find which agent is at this position
+                    for agent_idx, pos in self.layout_info.agent_positions.items():
+                        if pos == (x, y):
+                            row += str(agent_idx)  # Just the agent number
+                            break
                 elif (x, y) in entry_set:
                     row += f"{BLUE} {RESET}"  # Entry point (blue)
                 
-                # Check for capsules first (high priority visualization)
+                # Check for capsules (high priority visualization)
                 elif (x, y) in own_capsules or (x, y) in enemy_capsules:
                     row += f"{YELLOW}o{RESET}"
 
@@ -351,6 +357,17 @@ class LaPulga(CaptureAgent):
 
     # The high-level decision algorithm
     def choose_action(self, game_state):
+        # Pull the shared layout info at the start of each turn (memory reference)
+        # Both agents access the same layout object computed during initialization
+        self.layout_info = LaPulga._layout_info_shared
+        
+        # Update our position in the shared layout for visualization
+        current_pos = game_state.get_agent_position(self.index)
+        self.layout_info.update_agent_position(self.index, current_pos)
+        
+        if self.DEBUG:
+            self._print_layout_analysis(game_state, show_details=False)
+        
         # NUEVO: Lógica de actualización de memoria (Antes de analizar la situación)
         self._update_memory(game_state)
 
@@ -1158,6 +1175,13 @@ class LayoutInfo:
         self.cul_de_sac_cells = set()  # Dead-end zones
         self.cul_de_sac_clusters = []  # List of CulDeSac clusters
         self.cell_to_safety_type = {}  # Dict: (x,y) to 'safe_path' or 'cul_de_sac'
+        
+        # Agent position tracking (updated each turn to visualize movement)
+        self.agent_positions = {}  # Dict: agent_index to (x, y)
+    
+    def update_agent_position(self, agent_index, position):
+        """Update the position of an agent for visualization"""
+        self.agent_positions[agent_index] = position
 
 class LayoutAnalyzer:
     """Performs static analysis of the game layout (one-time at game start)"""
@@ -1594,4 +1618,5 @@ class LayoutAnalyzer:
             layout_info.cell_to_safety_type[cell] = 'safe_path'
         for cell in layout_info.cul_de_sac_cells:
             layout_info.cell_to_safety_type[cell] = 'cul_de_sac'
+
 
