@@ -1,5 +1,3 @@
-
-
 # my_team.py
 # ---------------
 # Licensing Information: Please do not distribute or publish solutions to this
@@ -33,10 +31,9 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.5.1, by Jorge and Oriol
+    """LaPulga v0.5.2, by Jorge and Oriol
     
-    NEW FIX: Now correctly classifies all cells on attacking side into safe paths and cul-de-sacs.
-    To be used to never again commit mistakes entering dead-end corridors.
+    NEW FIX: Now we are analyzing the powercapsule positions and the bes action possible idealyto do with that capsule.
     
     NEW PHASE: Initial static layout analysis with detailed debug output (not used for now on strategy)
     To be expanded and used during situation/strategy layers in upcoming versions.
@@ -50,6 +47,8 @@ class LaPulga(CaptureAgent):
     3. Goal: Chooses specific target coordinates based on role (Hammer vs Anvil).
     4. Pathfinding: A* with dynamic danger avoidance (avoids dead-ends if ghosts are near).
     5. Fallback: Stuck detection with strategic sacrifice to break stalemates.
+    209/125/196 (39.43%) para 10 games con HARDs, antes 37%
+    BENCHMARK:| 3068/4620 (66.41%)
     """
     
     DEBUG = True 
@@ -110,6 +109,26 @@ class LaPulga(CaptureAgent):
             cells_str = ", ".join(str(c) for c in eg.cells)
             print(f"  Group {eg.id}: {eg} | Cells: {cells_str}")
         
+        # NUEVO: Análisis estratégico de cápsulas
+        print(f"\nCapsules Analysis (Opportunities):")
+        print(f"  Own Capsules (Defending): {self.layout_info.own_capsules}")
+        
+        if self.layout_info.enemy_capsules:
+            print(f"  Enemy Capsules Strategy:")
+            # Ordenar cápsulas por valor estratégico descendente
+            sorted_capsules = sorted(self.layout_info.enemy_capsules, 
+                                   key=lambda c: self.layout_info.capsule_analysis[c].strategic_value, 
+                                   reverse=True)
+            
+            for cap_pos in sorted_capsules:
+                analysis = self.layout_info.capsule_analysis[cap_pos]
+                cluster_info = f"Cluster {analysis.nearest_cluster.id}" if analysis.nearest_cluster else "None"
+                print(f"    @ {cap_pos}: Score {analysis.strategic_value:.1f} | "
+                      f"Local Food: {analysis.local_food_count} | "
+                      f"Next Target -> {cluster_info} (dist: {analysis.dist_to_cluster})")
+        else:
+            print(f"  No Enemy Capsules detected.")
+
         print(f"\nOwn food clusters ({len(self.layout_info.own_clusters)}):")
         for fc in self.layout_info.own_clusters:
             food_str = ", ".join(str(f) for f in sorted(fc.initial_food))
@@ -130,11 +149,12 @@ class LaPulga(CaptureAgent):
             print(f"  {cul_de_sac} | Cells: {cells_str}")
         
         # ASCII map visualization
-        BLUE = "\033[44m"  # Blue background
+        BLUE = "\033[44m"   # Blue background
         GREEN = "\033[42m"  # Green background
         RED = "\033[41m"    # Red background
+        YELLOW = "\033[43m" # Yellow background (NEW for Capsules)
         RESET = "\033[0m"
-        print(f"\nMap Visualization: {BLUE} {RESET} = Entry Point, {GREEN} {RESET} = Safe Path, {RED} {RESET} = Cul-de-sac")
+        print(f"\nMap Visualization: {BLUE} {RESET} = Entry, {GREEN} {RESET} = Safe, {RED} {RESET} = Trap, {YELLOW}o{RESET} = Capsule")
         
         # Get all food positions
         entry_set = set(self.layout_info.boundary_cells)
@@ -145,6 +165,10 @@ class LaPulga(CaptureAgent):
         for cluster in self.layout_info.enemy_clusters:
             enemy_food.update(cluster.initial_food)
         
+        # Sets for capsules
+        own_capsules = set(self.layout_info.own_capsules)
+        enemy_capsules = set(self.layout_info.enemy_capsules)
+
         # Print map
         for y in range(height - 1, -1, -1):  # Print from top to bottom
             row = ""
@@ -153,26 +177,31 @@ class LaPulga(CaptureAgent):
                     row += "█"  # Wall
                 elif (x, y) in entry_set:
                     row += f"{BLUE} {RESET}"  # Entry point (blue)
+                
+                # Check for capsules first (high priority visualization)
+                elif (x, y) in own_capsules or (x, y) in enemy_capsules:
+                    row += f"{YELLOW}o{RESET}"
+
                 elif (x, y) in self.layout_info.corridor_cells:
-                    # Safe path, show food with color or empty space
+                    # Safe path
                     if (x, y) in own_food:
-                        row += f"{GREEN}●{RESET}"  # Own food on safe path
+                        row += f"{GREEN}●{RESET}"
                     elif (x, y) in enemy_food:
-                        row += f"{GREEN}○{RESET}"  # Enemy food on safe path
+                        row += f"{GREEN}○{RESET}"
                     else:
-                        row += f"{GREEN} {RESET}"  # Empty safe path
+                        row += f"{GREEN} {RESET}"
                 elif (x, y) in self.layout_info.cul_de_sac_cells:
-                    # Cul-de-sac, show food with color or empty space
+                    # Cul-de-sac
                     if (x, y) in own_food:
-                        row += f"{RED}●{RESET}"  # Own food on cul-de-sac
+                        row += f"{RED}●{RESET}"
                     elif (x, y) in enemy_food:
-                        row += f"{RED}○{RESET}"  # Enemy food on cul-de-sac
+                        row += f"{RED}○{RESET}"
                     else:
-                        row += f"{RED} {RESET}"  # Empty cul-de-sac
+                        row += f"{RED} {RESET}"
                 elif (x, y) in own_food:
-                    row += "●"  # Own food (unclassified)
+                    row += "●"
                 elif (x, y) in enemy_food:
-                    row += "○"  # Enemy food (unclassified)
+                    row += "○"
                 else:
                     row += " "  # Floor
             # Add y-coordinate label
@@ -192,7 +221,7 @@ class LaPulga(CaptureAgent):
         print(x_labels)
         
         print(f"{'='*80}\n")
-    
+            
     def _should_sacrifice(self, game_state):
         """Determine if we should sacrifice ourselves when stuck.
         
@@ -1070,6 +1099,20 @@ class CellInfo:
         return f"CellInfo({self.pos}, cul={self.is_cul_de_sac}, exits={self.num_exits})"
 
 
+class CapsuleAnalysis:
+    """Stores strategic value of a specific power capsule"""
+    def __init__(self, pos):
+        self.pos = pos
+        self.local_food_count = 0      # Food within immediate reach (e.g., 10 steps)
+        self.nearest_cluster = None    # The best FoodCluster to attack after this
+        self.dist_to_cluster = float('inf')
+        self.strategic_value = 0.0     # Heuristic score
+    
+    def __repr__(self):
+        cluster_id = self.nearest_cluster.id if self.nearest_cluster else "None"
+        return f"Capsule({self.pos}): Value={self.strategic_value:.1f}, LocalFood={self.local_food_count}, Aim->Cluster {cluster_id}"
+
+
 class LayoutInfo:
     """Container for all static layout analysis"""
     def __init__(self):
@@ -1083,12 +1126,16 @@ class LayoutInfo:
         self.enemy_clusters = []  # List of FoodCluster on enemy side
         self.cell_to_cluster = {}  # Dict: (x,y) to FoodCluster
         
+        # Capsule analysis
+        self.own_capsules = []    # List of (x,y)
+        self.enemy_capsules = []  # List of (x,y)
+        self.capsule_analysis = {} # Dict: (x,y) -> CapsuleAnalysis object (NUEVO)
+        
         # Corridor analysis
         self.corridor_cells = set()  # Safe paths (has redundant routes home)
         self.cul_de_sac_cells = set()  # Dead-end zones
         self.cul_de_sac_clusters = []  # List of CulDeSac clusters
         self.cell_to_safety_type = {}  # Dict: (x,y) to 'safe_path' or 'cul_de_sac'
-
 
 class LayoutAnalyzer:
     """Performs static analysis of the game layout (one-time at game start)"""
@@ -1104,10 +1151,92 @@ class LayoutAnalyzer:
         # Phase 2: Analyze food clusters on both sides
         self._analyze_food_clusters(layout_info, game_state, agent, team_is_red)
         
-        # Phase 3: Analyze corridors and cul-de-sacs on attack side
+        # Phase 3: Analyze power capsules and their potential (ACTUALIZADO)
+        self._analyze_capsules(layout_info, game_state, agent)
+        self._analyze_capsule_potential(layout_info, walls, agent)  # NUEVA LLAMADA
+
+        # Phase 4: Analyze corridors and cul-de-sacs on attack side
         self._analyze_corridors_and_culs_de_sac(layout_info, walls, team_is_red)
         
         return layout_info
+
+    def _analyze_capsules(self, layout_info, game_state, agent):
+        """Identify power capsules positions."""
+        layout_info.own_capsules = agent.get_capsules_you_are_defending(game_state)
+        layout_info.enemy_capsules = agent.get_capsules(game_state)
+
+    def _analyze_capsule_potential(self, layout_info, walls, agent):
+        """
+        Calculates the strategic value of each enemy capsule.
+        Determines the best next move (target cluster) after eating it.
+        """
+        for cap_pos in layout_info.enemy_capsules:
+            analysis = CapsuleAnalysis(cap_pos)
+            
+            # 1. Calculate Local Density: How much food is within 10 steps?
+            # This represents the "immediate reward" while invulnerable.
+            nearby_food = 0
+            search_depth = 10
+            
+            # Simple BFS for local food density
+            queue = [(cap_pos, 0)]
+            visited = {cap_pos}
+            
+            while queue:
+                curr, dist = queue.pop(0)
+                if dist > search_depth:
+                    continue
+                
+                # Check if this cell has food (using our static cluster map)
+                if curr in layout_info.cell_to_cluster:
+                    cluster = layout_info.cell_to_cluster[curr]
+                    if cluster.side == 'enemy': # Should be, but safety check
+                        nearby_food += 1
+                
+                if dist < search_depth:
+                    for neighbor in self._get_neighbors(curr, walls):
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            queue.append((neighbor, dist + 1))
+            
+            analysis.local_food_count = nearby_food
+            
+            # 2. Identify Best Cluster Target
+            # Which large food cluster is closest to this capsule?
+            best_cluster = None
+            min_dist = float('inf')
+            
+            for cluster in layout_info.enemy_clusters:
+                # Find distance from capsule to the NEAREST piece of food in this cluster
+                # We use Manhattan for speed in static analysis, or actual maze dist if careful
+                # Here we estimate using min maze distance to cluster members
+                
+                # Optimización: comprobar distancia al centroide o a un punto representativo
+                # Para precisión, buscamos la comida más cercana del cluster
+                dist_to_cluster = float('inf')
+                for food_pos in cluster.initial_food:
+                    d = abs(cap_pos[0] - food_pos[0]) + abs(cap_pos[1] - food_pos[1]) # Manhattan approx
+                    if d < dist_to_cluster:
+                        dist_to_cluster = d
+                
+                if dist_to_cluster < min_dist:
+                    min_dist = dist_to_cluster
+                    best_cluster = cluster
+            
+            analysis.nearest_cluster = best_cluster
+            analysis.dist_to_cluster = min_dist
+            
+            # 3. Calculate Strategic Score
+            # Formula: (Local Food * 2) + (Cluster Size / (Distance to Cluster + 1))
+            # Rewards capsules surrounded by food or close to big clusters.
+            cluster_value = 0
+            if best_cluster:
+                cluster_value = len(best_cluster.initial_food) / (min_dist + 1)
+            
+            analysis.strategic_value = (nearby_food * 2.0) + cluster_value
+            
+            # Store analysis
+            layout_info.capsule_analysis[cap_pos] = analysis
     
     def _analyze_home_entries(self, layout_info, walls, team_is_red):
         """
@@ -1320,11 +1449,25 @@ class LayoutAnalyzer:
             
             new_dead_ends = set()
             for cell in available:
-                # Count neighbors that are still available (not walls, not known cul-de-sacs)
-                available_neighbors = [n for n in self._get_neighbors(cell, walls) 
-                                      if n in available]
+                # Count neighbors that are exits
+                # An exit is either:
+                # 1. Another available cell (path deeper into enemy territory)
+                # 2. A safe cell (Home territory) - CRITICAL FIX: Don't treat home as a wall!
                 
-                if len(available_neighbors) == 1:
+                neighbors = self._get_neighbors(cell, walls)
+                exit_count = 0
+                
+                for n in neighbors:
+                    if n in available:
+                        exit_count += 1
+                    elif n not in passable_attack:
+                        # Neighbor is not in attack set, but is a valid non-wall.
+                        # This implies it's on our Home side.
+                        # Being connected to Home is the ultimate safety, so it counts as an exit.
+                        exit_count += 1
+                
+                # If only 0 or 1 exit, it's a dead end (cul-de-sac)
+                if exit_count <= 1:
                     new_dead_ends.add(cell)
             
             if not new_dead_ends:
@@ -1351,3 +1494,4 @@ class LayoutAnalyzer:
             layout_info.cell_to_safety_type[cell] = 'safe_path'
         for cell in layout_info.cul_de_sac_cells:
             layout_info.cell_to_safety_type[cell] = 'cul_de_sac'
+
