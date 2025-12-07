@@ -33,14 +33,17 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.6.0, by Jorge and Oriol
+    """LaPulga v0.6.1, by Jorge and Oriol
+    
+    NEW: Shared enemy radar position. Show exact enemy positions when visible (either close or when
+    they eat our food). Also food/capsule tracking is updated.
     
     NEW FEATURE: Shared layout information. The static layout is starting to become our main source of
     strategic knowledge, and we now have made it so that is is SHARED between the two instances of the
     agent! This still does not affect the current strategy, but can be a game changer thanks to allowing
     communication of static knowledge and explicit (non-emergent from heuristics) coordination logic.
-    To currently demonstrate it, the layout visualizer now shows both agents' positions on the map, each
-    currently updating only their own.
+    The layout visualizer now shows both agents' positions on the map (as numbers 0, 1) and enemies
+    (as red X marks), updating dynamically each turn.
 
     CORE ARCHITECTURE:
     1. Situation: Analyzes game state (visible/inferred threats, food counts, team positions).
@@ -173,18 +176,17 @@ class LaPulga(CaptureAgent):
             
             print(f"\nMap Visualization: {BLUE} {RESET} = Entry, {GREEN} {RESET} = Safe, {RED} {RESET} = Trap, {YELLOW}o{RESET} = Capsule")
         
-        # Get all food positions
+        # Get all current food positions (dynamically updated each turn)
         entry_set = set(self.layout_info.boundary_cells)
-        own_food = set()
-        enemy_food = set()
-        for cluster in self.layout_info.own_clusters:
-            own_food.update(cluster.initial_food)
-        for cluster in self.layout_info.enemy_clusters:
-            enemy_food.update(cluster.initial_food)
+        own_food = self.layout_info.current_own_food
+        enemy_food = self.layout_info.current_enemy_food
         
-        # Sets for capsules
-        own_capsules = set(self.layout_info.own_capsules)
-        enemy_capsules = set(self.layout_info.enemy_capsules)
+        # Sets for CURRENT capsules (dynamically updated each turn)
+        own_capsules = self.layout_info.current_own_capsules
+        enemy_capsules = self.layout_info.current_enemy_capsules
+        
+        # Get enemy positions for visualization
+        enemy_positions = {info['pos']: info for info in self.layout_info.enemy_positions.values()}
 
         # Print map
         for y in range(height - 1, -1, -1):  # Print from top to bottom
@@ -199,6 +201,15 @@ class LaPulga(CaptureAgent):
                         if pos == (x, y):
                             row += str(agent_idx)  # Just the agent number
                             break
+                # Check for enemy positions (show red X with different styling)
+                elif (x, y) in enemy_positions:
+                    enemy_info = enemy_positions[(x, y)]
+                    detection_type = enemy_info['detection_type']
+                    # Bright red X for visible enemies, dimmer for inferred
+                    if detection_type == 'visible':
+                        row += f"\033[91m✕\033[0m"  # Bright red X
+                    else:  # inferred
+                        row += f"\033[31m✕\033[0m"  # Dark red X
                 elif (x, y) in entry_set:
                     row += f"{BLUE} {RESET}"  # Entry point (blue)
                 
@@ -345,6 +356,12 @@ class LaPulga(CaptureAgent):
                 # Convertimos el set a lista y cogemos el primer elemento
                 self.memory_invader_pos = list(eaten_food)[0]
                 self.memory_timer = 20 # Recordar esto durante 20 turnos
+                
+                # Update shared layout with inferred enemy position
+                # We don't know which enemy it is, so we pick an arbitrary opponent index
+                opponents = self.get_opponents(game_state)
+                if opponents:
+                    self.layout_info.update_enemy_position(opponents[0], self.memory_invader_pos, 'inferred')
         
         # Actualizar la lista para el siguiente turno
         self.last_defending_food = current_defending_food
@@ -361,9 +378,23 @@ class LaPulga(CaptureAgent):
         # Both agents access the same layout object computed during initialization
         self.layout_info = LaPulga._layout_info_shared
         
+        # Decay enemy position timers (decrease by 1 each turn)
+        self.layout_info.decay_enemy_timers()
+        
+        # Update food and capsule positions in the shared layout
+        self.layout_info.update_food_and_capsules(game_state, self)
+        
         # Update our position in the shared layout for visualization
         current_pos = game_state.get_agent_position(self.index)
         self.layout_info.update_agent_position(self.index, current_pos)
+        
+        # Detect and update visible enemies in the shared layout
+        opponent_indices = self.get_opponents(game_state)
+        for opponent_idx in opponent_indices:
+            enemy = game_state.get_agent_state(opponent_idx)
+            enemy_pos = enemy.get_position()
+            if enemy_pos is not None:  # Visible enemy
+                self.layout_info.update_enemy_position(opponent_idx, enemy_pos, 'visible')
         
         if self.DEBUG:
             self._print_layout_analysis(game_state, show_details=False)
@@ -1170,6 +1201,12 @@ class LayoutInfo:
         self.enemy_capsules = []  # List of (x,y)
         self.capsule_analysis = {} # Dict: (x,y) -> CapsuleAnalysis object (NUEVO)
         
+        # Dynamic food/capsule tracking (updated each turn)
+        self.current_own_food = set()  # Current food on our side
+        self.current_enemy_food = set()  # Current food on enemy side
+        self.current_own_capsules = set()  # Current capsules on our side
+        self.current_enemy_capsules = set()  # Current capsules on enemy side
+        
         # Corridor analysis
         self.corridor_cells = set()  # Safe paths (has redundant routes home)
         self.cul_de_sac_cells = set()  # Dead-end zones
@@ -1178,10 +1215,46 @@ class LayoutInfo:
         
         # Agent position tracking (updated each turn to visualize movement)
         self.agent_positions = {}  # Dict: agent_index to (x, y)
+        
+        # Enemy position tracking (visible and inferred)
+        self.enemy_positions = {}  # Dict: enemy_index -> (pos, timer, detection_type)
+        # detection_type: 'visible' or 'inferred' (from eaten food)
     
     def update_agent_position(self, agent_index, position):
         """Update the position of an agent for visualization"""
         self.agent_positions[agent_index] = position
+    
+    def update_enemy_position(self, enemy_index, position, detection_type='visible'):
+        """Update detected enemy position with a countdown timer
+        
+        Args:
+            enemy_index: Index of the enemy agent
+            position: (x, y) position of the enemy
+            detection_type: 'visible' or 'inferred' (from eaten food)
+        """
+        self.enemy_positions[enemy_index] = {
+            'pos': position,
+            'timer': 4 if detection_type == 'inferred' else 3,  # 4-5 turns for inferred, 3 for visible
+            'detection_type': detection_type
+        }
+    
+    def decay_enemy_timers(self):
+        """Decrease timers for all known enemies. Remove when timer reaches 0."""
+        to_remove = []
+        for enemy_idx in self.enemy_positions:
+            self.enemy_positions[enemy_idx]['timer'] -= 1
+            if self.enemy_positions[enemy_idx]['timer'] <= 0:
+                to_remove.append(enemy_idx)
+        
+        for enemy_idx in to_remove:
+            del self.enemy_positions[enemy_idx]
+    
+    def update_food_and_capsules(self, game_state, agent):
+        """Update current food and capsule positions from the game state"""
+        self.current_own_food = set(agent.get_food_you_are_defending(game_state).as_list())
+        self.current_enemy_food = set(agent.get_food(game_state).as_list())
+        self.current_own_capsules = set(agent.get_capsules_you_are_defending(game_state))
+        self.current_enemy_capsules = set(agent.get_capsules(game_state))
 
 class LayoutAnalyzer:
     """Performs static analysis of the game layout (one-time at game start)"""
