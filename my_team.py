@@ -17,12 +17,6 @@ from game import Directions
 
 def create_team(first_index, second_index, is_red,
                 first='LaPulga', second='LaPulga', num_training=0): # We use our LaPulga agent for both slots
-    """
-    This function should return a list of two agents that will form the
-    team, initialized using firstIndex and secondIndex as their agent
-    index numbers.  isRed is True if the red team is being created, and
-    will be False if the blue team is being created.
-    """
     return [eval(first)(first_index), eval(second)(second_index)]
 
 ##########
@@ -30,30 +24,36 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class LaPulga(CaptureAgent):
-    """LaPulga v0.4.8, by Jorge and Oriol
+    """LaPulga v0.4.9, by Jorge and Oriol
+    Our pure reflex agent with an easy-to-understand layered architecture.
     
-    NEW STRATEGY: Pincer Defense (Hammer & Anvil)
-    Solves the "Conga Line" issue where two defenders chased the same invader inefficiently.
-    - Primary Defender (The Hammer): The agent closest to the enemy invader pursues directly to kill.
-    - Secondary Defender (The Anvil): The agent further away moves to the boundary/frontier to cut off the enemy's escape route.
-    
-    PREVIOUS CRITICAL FIXES (v1.0):
-    1. Inference Defense (Food Memory): BREAKS BLINDNESS in Jumbo maps. Tracks disappearing food to infer invisible enemy positions and moves to investigate.
-    2. Fearless Defense: Fixed a bug where defenders treated non-scared enemy Pacmen as "Dangerous Obstacles" in A*. Now treats them as FOOD targets (Fixes -56 score in fastCapture).
-    3. Anti-Greed Logic: If the path home is blocked while carrying food, switches target to the nearest capsule or evasive maneuvers instead of freezing.
-    4. Jumbo Range: Increased A* search depth to 300 to handle large maps.
-
-    CORE ARCHITECTURE:
+    CORE ARCHITECTURE remains mostly the same from last contest run:
     1. Situation: Analyzes game state (visible/inferred threats, food counts, team positions).
-    2. Strategy: Selects high-level mode ('attack', 'defend', 'return', 'scare_retreat').
-       - Now includes 'Recall' logic: attackers return home if a threat is detected.
-    3. Goal: Chooses specific target coordinates based on role (Hammer vs Anvil).
-    4. Pathfinding: A* with dynamic danger avoidance (avoids dead-ends if ghosts are near).
+    2. Strategy: Selects high-level mode (like 'attack', 'defend', 'return', 'scare_retreat',...).
+    3. Goal: Chooses specific target coordinates based on the strategy and situation.
+    4. Pathfinding: A* with dynamic danger avoidance (that avoids dead-ends if ghosts are near).
     5. Fallback: Stuck detection with strategic sacrifice to break stalemates.
+    
+    We have also started some major refactorings in a separate branch, which introduced some
+    changes to the architecture that would enable us to drastically improve the agent in future versions:
+    - Using the 15 initial seconds to precompute paths and deeply analyze the map layout, which we are currently not using to our advantage
+    - Implemented a form of memory sharing between the two instances of the class, so both have the same "state" and can communicate
+    - Instead of single goals, we can exhaustively evaluate which routes are optimal
+    - Infer and track enemy positions even when they are invisible (not in line of sight)
+    Unfortunately we haven't had time to replace current logic with the new classes in time for the tournament due to the dates coinciding with final exams.
+    Hopefully we can continue improving this agent in future versions, especially now that we see a clear path forward for major improvements.
+    
+    FIXES and PATCHES SINCE ORIGINAL TOURNAMENT, to fix the most critical issues we observed from our agent:
+    1. Inference defense (Food memory): Tracks disappearing food to infer invisible enemy positions and moves to investigate.
+    2. Patched a case where defenders treated non-scared enemy Pacmen as "Dangerous obstacles" in A*. Now treats them as FOOD targets.
+    3. If the path home is blocked while carrying food, switches target to the nearest capsule or evasive maneuvers instead of freezing.
+    4. Increased A* search depth to 300 to handle large maps.
+    5. Solved cases where we had a "Conga Line" of defenders chasing the same invader inefficiently.
+    Most of these behaviours shouldn't be happening with sufficient planning and intelligent goal selection, but we have still been able to improve current architecture
+    using these patches without a full rewrite.
     """
     
-    # Set to True to see debug output about scared retreat behavior and stuck detection
-    DEBUG = True  # Enabled to debug stuck detection
+    DEBUG = False  # Enable to debug stuck detection
     
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
@@ -76,129 +76,22 @@ class LaPulga(CaptureAgent):
         self.start = game_state.get_agent_position(self.index)
         CaptureAgent.register_initial_state(self, game_state)
         
-        # NUEVO: Inicializar memoria de comida defensiva
+        # NEW: Initialize defensive food memory
         self.last_defending_food = self.get_food_you_are_defending(game_state).as_list()
-        self.memory_invader_pos = None # Última posición conocida/inferida del invasor
-        self.memory_timer = 0          # Cuánto tiempo recordar esa posición
-        
-    def _should_sacrifice(self, game_state):
-        """Determine if we should sacrifice ourselves when stuck.
-        
-        Only sacrifice if we're losing or tied. If winning, staying stuck is good.
-        """
-        score = game_state.get_score()
-        
-        # Adjust score based on team (red team has positive score when winning)
-        if not game_state.is_on_red_team(self.index):
-            score = -score
-        
-        # Sacrifice if we're losing or tied
-        # If score > 0, we're winning, so don't sacrifice
-        return score <= 0
-    
-    def _get_suicide_action(self, game_state):
-        """Get an action that moves us towards the nearest enemy (to get killed).
-        
-        This breaks stalemates where we're stuck in a corridor.
-        """
-        current_pos = game_state.get_agent_position(self.index)
-        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-        
-        # Find nearest visible enemy
-        visible_enemies = [e for e in enemies if e.get_position() is not None]
-        if not visible_enemies:
-            # No visible enemies, just try to move in any valid direction
-            return self._get_any_valid_action(game_state)
-        
-        # Get closest enemy position
-        enemy_positions = [e.get_position() for e in visible_enemies]
-        closest_enemy = min(enemy_positions, 
-                          key=lambda pos: self.get_maze_distance(current_pos, pos))
-        
-        # Find the action that moves us closest to the enemy
-        legal_actions = game_state.get_legal_actions(self.index)
-        if Directions.STOP in legal_actions:
-            legal_actions.remove(Directions.STOP)  # Don't stay still
-        
-        if not legal_actions:
-            return Directions.STOP
-        
-        # Choose action that minimizes distance to enemy
-        best_action = None
-        best_dist = float('inf')
-        
-        for action in legal_actions:
-            successor = game_state.generate_successor(self.index, action)
-            new_pos = successor.get_agent_position(self.index)
-            dist = self.get_maze_distance(new_pos, closest_enemy)
-            
-            if dist < best_dist:
-                best_dist = dist
-                best_action = action
-        
-        return best_action if best_action else Directions.STOP
-    
-    def _get_any_valid_action(self, game_state):
-        """Get any valid action when we can't see enemies."""
-        legal_actions = game_state.get_legal_actions(self.index)
-        if Directions.STOP in legal_actions:
-            legal_actions.remove(Directions.STOP)
-        
-        return legal_actions[0] if legal_actions else Directions.STOP
-    
-    def _is_oscillating(self):
-        """Detect if agent is oscillating in a small area (trapped but moving).
-        
-        Returns True if all positions in history are within a small radius.
-        """
-        if len(self.position_history) < 8:  # Reduced from 10 for faster detection
-            return False
-        
-        # Calculate the bounding box of recent positions
-        x_coords = [pos[0] for pos in self.position_history]
-        y_coords = [pos[1] for pos in self.position_history]
-        
-        x_range = max(x_coords) - min(x_coords)
-        y_range = max(y_coords) - min(y_coords)
-        
-        # If moving in area smaller than 2x2, we're oscillating/trapped
-        OSCILLATION_THRESHOLD = 2  # Reduced from 3 for more aggressive detection
-        return x_range <= OSCILLATION_THRESHOLD and y_range <= OSCILLATION_THRESHOLD
-        
-        
-    def _update_memory(self, game_state):
-        """Detecta comida desaparecida y actualiza la posición inferida del enemigo"""
-        current_defending_food = self.get_food_you_are_defending(game_state).as_list()
-        
-        # Si tenemos menos comida que antes, alguien se la ha comido
-        if len(current_defending_food) < len(self.last_defending_food):
-            # Encontrar qué punto de comida falta (diferencia de conjuntos)
-            eaten_food = set(self.last_defending_food) - set(current_defending_food)
-            
-            if eaten_food:
-                # El enemigo está (o estaba hace poco) en esa posición
-                # Convertimos el set a lista y cogemos el primer elemento
-                self.memory_invader_pos = list(eaten_food)[0]
-                self.memory_timer = 20 # Recordar esto durante 20 turnos
-        
-        # Actualizar la lista para el siguiente turno
-        self.last_defending_food = current_defending_food
-        
-        # Decaer el temporizador de memoria
-        if self.memory_timer > 0:
-            self.memory_timer -= 1
-        else:
-            self.memory_invader_pos = None
+        self.memory_invader_pos = None # Last known/inferred invader position
+        self.memory_timer = 0          # How long to remember that position
 
     # The high-level decision algorithm
     def choose_action(self, game_state):
-        # NUEVO: Lógica de actualización de memoria (Antes de analizar la situación)
+        # NEW: Memory update logic (Before analyzing the situation)
         self._update_memory(game_state)
 
+        # MAIN ALGORITHM: ---------------------------------------------------
         self.situation = self.situation_analyzer.analyze(game_state, self)
         self.strategy = self.strategy_selector.select_strategy(self.situation)
         self.goal = self.goal_chooser.choose_goal(game_state, self, self.situation, self.strategy)
         path = self.path_finder.search(game_state, self, self.goal)
+        # -------------------------------------------------------------------
         
         current_pos = game_state.get_agent_position(self.index)
         
@@ -253,8 +146,112 @@ class LaPulga(CaptureAgent):
                 if self.DEBUG:
                     print(f"Agent {self.index}: STUCK but WINNING (score: {game_state.get_score()}) - staying put")
         
-        # Fallback: return STOP
+        # Fallback: return STOP. Should ideally never be reached, useful for debugging current architecture
         return Directions.STOP
+    
+    
+    def _should_sacrifice(self, game_state):
+        score = game_state.get_score()
+        
+        # Adjust score based on team (red team has positive score when winning)
+        if not game_state.is_on_red_team(self.index):
+            score = -score
+        
+        # Sacrifice if we're losing or tied
+        # If score > 0, we're winning, so don't sacrifice
+        return score <= 0
+    
+    def _get_suicide_action(self, game_state):
+        """Get an action that moves us towards the nearest enemy (to get killed).
+        This patch breaks stalemates where we're stuck in a corridor.
+        """
+        current_pos = game_state.get_agent_position(self.index)
+        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
+        
+        # Find nearest visible enemy
+        visible_enemies = [e for e in enemies if e.get_position() is not None]
+        if not visible_enemies:
+            # No visible enemies, just try to move in any valid direction
+            return self._get_any_valid_action(game_state)
+        
+        # Get closest enemy position
+        enemy_positions = [e.get_position() for e in visible_enemies]
+        closest_enemy = min(enemy_positions, 
+                          key=lambda pos: self.get_maze_distance(current_pos, pos))
+        
+        # Find the action that moves us closest to the enemy
+        legal_actions = game_state.get_legal_actions(self.index)
+        if Directions.STOP in legal_actions:
+            legal_actions.remove(Directions.STOP)  # Don't stay still
+        
+        if not legal_actions:
+            return Directions.STOP
+        
+        # Choose action that minimizes distance to enemy
+        best_action = None
+        best_dist = float('inf')
+        
+        for action in legal_actions:
+            successor = game_state.generate_successor(self.index, action)
+            new_pos = successor.get_agent_position(self.index)
+            dist = self.get_maze_distance(new_pos, closest_enemy)
+            
+            if dist < best_dist:
+                best_dist = dist
+                best_action = action
+        
+        return best_action if best_action else Directions.STOP
+    
+    def _get_any_valid_action(self, game_state):
+        """Get any valid action when we can't see enemies."""
+        legal_actions = game_state.get_legal_actions(self.index)
+        if Directions.STOP in legal_actions:
+            legal_actions.remove(Directions.STOP)
+        
+        return legal_actions[0] if legal_actions else Directions.STOP
+    
+    def _is_oscillating(self):
+        """Detect if agent is oscillating in a small area (trapped but moving).
+        Returns True if all positions in history are within a small radius.
+        """
+        if len(self.position_history) < 8:  # Reduced from 10 for faster detection
+            return False
+        
+        # Calculate the bounding box of recent positions
+        x_coords = [pos[0] for pos in self.position_history]
+        y_coords = [pos[1] for pos in self.position_history]
+        
+        x_range = max(x_coords) - min(x_coords)
+        y_range = max(y_coords) - min(y_coords)
+        
+        # If moving in area smaller than 2x2, we're oscillating/trapped
+        OSCILLATION_THRESHOLD = 2  # Reduced from 3 for more aggressive detection
+        return x_range <= OSCILLATION_THRESHOLD and y_range <= OSCILLATION_THRESHOLD
+        
+        
+    def _update_memory(self, game_state):
+        """Detects disappeared food and updates the inferred position of the enemy"""
+        current_defending_food = self.get_food_you_are_defending(game_state).as_list()
+        
+        # If we have less food than before, someone ate it
+        if len(current_defending_food) < len(self.last_defending_food):
+            # Find which food point is missing (set difference)
+            eaten_food = set(self.last_defending_food) - set(current_defending_food)
+            
+            if eaten_food:
+                # The enemy is (or was recently) at that position
+                # Convert the set to a list and take the first element
+                self.memory_invader_pos = list(eaten_food)[0]
+                self.memory_timer = 20 # Remember this for 20 turns
+        
+        # Update the list for the next turn
+        self.last_defending_food = current_defending_food
+        
+        # Decay the memory timer
+        if self.memory_timer > 0:
+            self.memory_timer -= 1
+        else:
+            self.memory_invader_pos = None
 
 
 ###########################
@@ -340,15 +337,15 @@ class SituationAnalyzer:
         # ---------------------------------------------------------
         team_indices = sorted(agent.get_team(game_state))
         
-        # NUEVO: Pasar la memoria del agente a la situación
+        # NEW: Pass the agent's memory to the situation
         situation.inferred_invader_pos = agent.memory_invader_pos
         situation.has_inferred_invader = (agent.memory_invader_pos is not None)
         
-        # Definir si hay amenaza en el objeto situation
+        # Define if there is a threat in the situation object
         situation.has_threat = situation.has_invaders_visible or situation.has_inferred_invader
 
-        # --- LÓGICA DE ROL DEFENSIVO AVANZADA (MARTILLO Y YUNQUE) ---
-        situation.is_primary_defender = True # Por defecto asumimos que somos el principal
+        # --- ADVANCED DEFENSIVE ROLE LOGIC (HAMMER AND ANVIL) ---
+        situation.is_primary_defender = True # By default we assume we are the primary
         
         if situation.has_threat:
             target = situation.visible_invaders[0] if situation.visible_invaders else situation.inferred_invader_pos
@@ -356,16 +353,16 @@ class SituationAnalyzer:
                 my_dist = agent.get_maze_distance(agent_pos, target)
                 mate_dist = agent.get_maze_distance(teammate_pos, target)
                 
-                # Quien esté más cerca es el Defensor Primario (Martillo)
+                # Whoever is closer is the Primary Defender (Hammer)
                 if my_dist < mate_dist:
                     situation.is_primary_defender = True
                 elif my_dist > mate_dist:
                     situation.is_primary_defender = False
                 else:
-                    # Desempate por índice para evitar que ambos crean ser el secundario
+                    # Tiebreaker by index to prevent both from thinking they are secondary
                     situation.is_primary_defender = (agent.index < team_indices[1]) 
         else:
-             # Si no hay amenaza, definimos roles por defecto
+             # If there is no threat, we define default roles
              situation.is_primary_defender = (agent.index == team_indices[0])
 
         return situation
@@ -389,7 +386,7 @@ class Situation:
         self.visible_invaders = []
         self.has_invaders_visible = False
         
-        # NUEVO: Invasor inferido (no visible pero sabemos que está ahí)
+        # NEW: Inferred invader (not visible but we know it's there)
         self.inferred_invader_pos = None
         self.has_inferred_invader = False
         
@@ -416,26 +413,26 @@ class Situation:
 
 class StrategySelector:
     def select_strategy(self, situation):
-        # 1. Supervivencia (Prioridad absoluta)
+        # 1. Survival (Absolute priority)
         if situation.we_are_scared and situation.has_invaders_visible and situation.on_own_side:
             return 'scare_retreat'
             
-        # 2. Modo Depredador (Comer fantasmas asustados)
+        # 2. Predator Mode (Eat scared ghosts)
         if situation.has_scared_ghosts:
             return 'attack'
             
-        # 3. Retorno Seguro (Evitar morir cargado de comida)
-        # Bajamos un poco el threshold para asegurar puntos
+        # 3. Safe Return (Avoid dying with food)
+        # Lower the threshold a bit to ensure points
         if situation.carrying_food >= 5: 
             return 'return'
         if situation.carrying_food > 0 and (situation.time_remaining < 60 or situation.food_remaining <= 2):
             return 'return'
             
-        # 4. DEFENSA REFORZADA (CORRECCIÓN CRÍTICA)
-        # Si hay amenaza, verificamos si nos toca defender AUNQUE estemos fuera
+        # 4. REINFORCED DEFENSE (CRITICAL FIX)
+        # If there is a threat, we check if it's our turn to defend EVEN IF WE'RE OUTSIDE
         if situation.has_threat:
             if situation.on_own_side: return 'defend'
-            # Si estoy fuera pero soy el primario (el más cercano a la amenaza), vuelvo
+            # If I'm outside but I'm the primary (closest to the threat), I return
             if situation.is_primary_defender: return 'defend'
             
         if situation.winning and situation.is_primary_defender:
@@ -469,10 +466,7 @@ class GoalChooser:
     def _goal_attack(self, game_state, agent, situation):
         """Attack strategy: Target capsules if useful, then food, avoiding ghosts."""        
         
-        # ---------------------------------------------------------
-        # 1. CAPSULE LOGIC (New Priority - FIXED API CALL)
-        # ---------------------------------------------------------
-        # Fixed: Using get_capsules (snake_case) instead of getCapsules
+        # 1. CAPSULE LOGIC
         capsules = agent.get_capsules(game_state) 
         
         if capsules:
@@ -493,9 +487,7 @@ class GoalChooser:
                 if self._is_pos_safe(game_state, agent, closest_capsule, situation.agent_pos, ghost_pos):
                     return closest_capsule
 
-        # ---------------------------------------------------------
         # 2. FOOD LOGIC (Standard)
-        # ---------------------------------------------------------
         food_list = agent.get_food(game_state).as_list()
         
         # If we have teammate position info, divide territory to avoid conflicts
@@ -536,7 +528,6 @@ class GoalChooser:
         return agent.start
     
     def _is_pos_safe(self, game_state, agent, target_pos, agent_pos, ghost_pos):
-        """Check if pursuing a target position (food/capsule) is safe given a nearby ghost."""
         if ghost_pos is None:
             return True
             
@@ -554,7 +545,7 @@ class GoalChooser:
         return dist_ghost_to_target > dist_agent_to_target + 2
 
     def _goal_defend(self, game_state, agent, situation):
-        # Objetivo prioritario: Enemigo (Visible > Inferido)
+        # Priority objective: Enemy (Visible > Inferred)
         target = None
         if situation.visible_invaders:
             target = min(situation.visible_invaders, key=lambda i: agent.get_maze_distance(situation.agent_pos, i))
@@ -562,22 +553,22 @@ class GoalChooser:
             target = situation.inferred_invader_pos
             
         if target:
-            # TÁCTICA DE PINZA:
-            # Si soy el Primario -> Voy directo al objetivo (Persecución)
-            # Si soy el Secundario -> Voy a bloquear su salida (Intercepción)
+            # PINCER TACTIC:
+            # If I'm Primary -> Go directly to target (Chase)
+            # If I'm Secondary -> Go to block their exit (Intercept)
             
-            # Excepción: Si estoy muy cerca (<5 pasos), voy a matar siempre (doble ataque)
+            # Exception: If I'm very close (<5 steps), I always go kill (double attack)
             if situation.is_primary_defender or agent.get_maze_distance(situation.agent_pos, target) < 5:
                 return target
             else:
-                # Lógica de "El Yunque": Ir al punto de frontera más cercano al enemigo
+                # "Anvil" Logic: Go to the boundary point closest to the enemy
                 walls = game_state.get_walls()
                 mid_x = walls.width // 2
                 boundary_x = mid_x - 1 if game_state.is_on_red_team(agent.index) else mid_x
                 
                 valid_boundary_spots = [(boundary_x, y) for y in range(walls.height) if not walls[boundary_x][y]]
                 if valid_boundary_spots:
-                    # Elegir el punto de frontera que esté más cerca del ENEMIGO, no de mí.
+                    # Choose the boundary point closest to the ENEMY, not to me.
                     intercept_point = min(valid_boundary_spots, key=lambda p: agent.get_maze_distance(target, p))
                     return intercept_point
                 return target # Fallback
@@ -666,6 +657,7 @@ class GoalChooser:
                 return best_position
         
         return agent.start
+    
 ###########################
 # Layer 4: Pathfinding (A*)
 ###########################
@@ -676,7 +668,6 @@ class PathFinder:
     Avoids walls and dangerous ghosts.
     When ghost is nearby, also avoids dead-end corridors.
     """
-    
     _corridor_cache = {}  # Cache for corridor analysis
     
     @classmethod
@@ -792,19 +783,19 @@ class PathFinder:
             
             is_dangerous = False
             
-            # CASO 1: SOMOS PACMAN (Atacando)
+            # CASE 1: WE ARE PACMAN (Attacking)
             if agent_state.is_pacman:
-                # Nos mata cualquier fantasma no asustado
+                # Any non-scared ghost kills us
                 if not enemy.is_pacman and enemy.scared_timer <= 0:
                     is_dangerous = True
             
-            # CASO 2: SOMOS FANTASMA (Defendiendo)
+            # CASE 2: WE ARE GHOST (Defending)
             else:
-                # Solo nos mata un Pacman SI nosotros estamos asustados
+                # Only a Pacman kills us IF we are scared
                 if we_are_scared and enemy.is_pacman:
                     is_dangerous = True
-                # IMPORTANTE: Si NO estamos asustados, el Pacman enemigo NO es peligroso.
-                # Es comida. Al no marcarlo como danger, el A* permitirá chocar con él.
+                # IMPORTANT: If we are NOT scared, the enemy Pacman is NOT dangerous.
+                # It's food. By not marking it as danger, A* will allow us to collide with it.
 
             if not is_dangerous:
                 continue
