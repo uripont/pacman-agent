@@ -1,3 +1,3 @@
 [submodule "pacman-contest"]
 	path = pacman-contest
-	url = https://github.com/aig-upf/pacman-contest.git
+	url = https://github.com/uripont/pacman-contest.git # Our fork, runs 3-4x faster without major rewrite
